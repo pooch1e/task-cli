@@ -52,14 +52,14 @@ Rules:
 - Each task may have 0-4 subtasks
 - acceptance_criteria should have 2-4 items
 - Output ONLY the JSON object, nothing else`,
-		sanitiseInput(req.ProjectName),
-		sanitiseInput(req.Feature),
+		sanitizeInput(req.ProjectName),
+		sanitizeInput(req.Feature),
 	)
 	return PromptParts{System: systemPrompt, User: user}
 }
 
-// sanitiseInput applies HTML escaping to prevent XML-delimiter injection and
+// sanitizeInput applies HTML escaping to prevent XML-delimiter injection and
 // trims surrounding whitespace.
-func sanitiseInput(s string) string {
+func sanitizeInput(s string) string {
 	return strings.TrimSpace(html.EscapeString(s))
 }

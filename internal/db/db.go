@@ -15,19 +15,27 @@ import (
 //go:embed schema.sql
 var schema string
 
-// SELECT column lists — defined once so schema changes are a single edit.
+// SELECT column lists — single source of truth for column order.
 const (
 	storySelectCols = "id, project_id, slug, title, description, acceptance_criteria, status, created_at"
 	taskSelectCols  = "id, story_id, slug, title, status, created_at, updated_at"
 )
 
-// DB wraps sql.DB with task-specific helpers.
+// DB wraps a SQLite connection. The internal conn is not embedded to prevent
+// callers from bypassing the custom query helpers and their error handling.
 type DB struct {
-	*sql.DB
+	conn *sql.DB
 }
 
-// Open opens (or creates) the SQLite database at path, runs migrations, and
-// sets file permissions to 0600.
+// Close releases the database connection.
+func (db *DB) Close() error { return db.conn.Close() }
+
+// Begin starts a transaction. Exposed so callers can use db.Begin() when they
+// need multi-step atomic operations not covered by the helper methods.
+func (db *DB) Begin() (*sql.Tx, error) { return db.conn.Begin() }
+
+// Open opens (or creates) the SQLite database at path, runs schema migrations,
+// and sets file permissions to 0600.
 func Open(path string) (*DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return nil, fmt.Errorf("creating db dir: %w", err)
@@ -38,7 +46,7 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("opening db: %w", err)
 	}
 
-	conn.SetMaxOpenConns(1) // SQLite is single-writer
+	conn.SetMaxOpenConns(1) // SQLite: single writer
 
 	if err := conn.Ping(); err != nil {
 		return nil, fmt.Errorf("pinging db: %w", err)
@@ -52,7 +60,7 @@ func Open(path string) (*DB, error) {
 		log.Printf("warning: could not set db file permissions: %v", err)
 	}
 
-	return &DB{conn}, nil
+	return &DB{conn: conn}, nil
 }
 
 // ── Projects ──────────────────────────────────────────────────────────────────
@@ -65,7 +73,7 @@ type Project struct {
 }
 
 func (db *DB) UpsertProject(name, path string) (*Project, error) {
-	_, err := db.Exec(
+	_, err := db.conn.Exec(
 		`INSERT INTO projects (name, path) VALUES (?, ?)
          ON CONFLICT(name) DO UPDATE SET path = excluded.path`,
 		name, path,
@@ -77,13 +85,18 @@ func (db *DB) UpsertProject(name, path string) (*Project, error) {
 }
 
 func (db *DB) GetProject(name string) (*Project, error) {
-	row := db.QueryRow(`SELECT id, name, path, created_at FROM projects WHERE name = ?`, name)
 	p := &Project{}
-	return p, row.Scan(&p.ID, &p.Name, &p.Path, &p.CreatedAt)
+	err := db.conn.QueryRow(
+		`SELECT id, name, path, created_at FROM projects WHERE name = ?`, name,
+	).Scan(&p.ID, &p.Name, &p.Path, &p.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("project %q not found", name)
+	}
+	return p, err
 }
 
 func (db *DB) ListProjects() ([]*Project, error) {
-	rows, err := db.Query(`SELECT id, name, path, created_at FROM projects ORDER BY name`)
+	rows, err := db.conn.Query(`SELECT id, name, path, created_at FROM projects ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -100,6 +113,48 @@ func (db *DB) ListProjects() ([]*Project, error) {
 	return out, rows.Err()
 }
 
+// ── Slug generation ───────────────────────────────────────────────────────────
+
+// nextSlug derives the next available slug for a project-scoped sequence.
+// It uses MAX(numeric suffix) so deletion never produces collisions.
+// Accepts an optional *sql.Tx; pass nil to use the main connection.
+//
+//   prefix: "S" → "S-1", "S-2" …
+//   table:  "stories" or "tasks"
+//   joinSQL: optional JOIN clause to filter by project (for tasks)
+func (db *DB) nextSlug(tx execer, prefix, table, slugCol string, projectID int64) (string, error) {
+	// Tasks are spread across stories, so we join via stories to scope by project.
+	// Stories are directly project-scoped.
+	var query string
+	if table == "stories" {
+		query = fmt.Sprintf(
+			`SELECT MAX(CAST(REPLACE(%s, '%s-', '') AS INTEGER))
+             FROM %s WHERE project_id = ?`, slugCol, prefix, table)
+	} else {
+		// tasks: join through stories
+		query = fmt.Sprintf(
+			`SELECT MAX(CAST(REPLACE(t.%s, '%s-', '') AS INTEGER))
+             FROM %s t JOIN stories s ON s.id = t.story_id
+             WHERE s.project_id = ?`, slugCol, prefix, table)
+	}
+
+	var maxN sql.NullInt64
+	if err := tx.QueryRow(query, projectID).Scan(&maxN); err != nil {
+		return "", fmt.Errorf("computing next %s slug: %w", prefix, err)
+	}
+	n := int64(0)
+	if maxN.Valid {
+		n = maxN.Int64
+	}
+	return fmt.Sprintf("%s-%d", prefix, n+1), nil
+}
+
+// execer abstracts *sql.DB and *sql.Tx so nextSlug works with both.
+type execer interface {
+	QueryRow(query string, args ...any) *sql.Row
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
 // ── Stories ───────────────────────────────────────────────────────────────────
 
 type Story struct {
@@ -113,7 +168,7 @@ type Story struct {
 	CreatedAt          time.Time
 }
 
-// TaskInput describes a task and its subtitles for bulk story persistence.
+// TaskInput describes a task and its subtasks for bulk story persistence.
 type TaskInput struct {
 	Title    string
 	Subtasks []string
@@ -123,12 +178,11 @@ func (db *DB) CreateStory(projectID int64, title, description, acceptanceCriteri
 	if title == "" {
 		return nil, fmt.Errorf("story title cannot be empty")
 	}
-	slug, err := db.nextStorySlug(projectID)
+	slug, err := db.nextSlug(db.conn, "S", "stories", "slug", projectID)
 	if err != nil {
 		return nil, err
 	}
-
-	res, err := db.Exec(
+	res, err := db.conn.Exec(
 		`INSERT INTO stories (project_id, slug, title, description, acceptance_criteria) VALUES (?, ?, ?, ?, ?)`,
 		projectID, slug, title, description, acceptanceCriteria,
 	)
@@ -139,46 +193,24 @@ func (db *DB) CreateStory(projectID int64, title, description, acceptanceCriteri
 	return db.GetStoryByID(id)
 }
 
-// nextStorySlug derives the next slug by finding the maximum existing numeric
-// suffix. Using MAX rather than COUNT means deletion + re-insertion never
-// produces a colliding slug.
-func (db *DB) nextStorySlug(projectID int64) (string, error) {
-	var maxN sql.NullInt64
-	err := db.QueryRow(
-		`SELECT MAX(CAST(REPLACE(slug, 'S-', '') AS INTEGER))
-         FROM stories WHERE project_id = ?`, projectID,
-	).Scan(&maxN)
-	if err != nil {
-		return "", err
-	}
-	n := int64(0)
-	if maxN.Valid {
-		n = maxN.Int64
-	}
-	return fmt.Sprintf("S-%d", n+1), nil
-}
-
 // PersistStory writes a story, its tasks, and subtasks in a single transaction.
-// All inserts succeed or all are rolled back — no orphaned records.
 func (db *DB) PersistStory(projectID int64, title, description, acJSON string, tasks []TaskInput) (*Story, error) {
 	if title == "" {
 		return nil, fmt.Errorf("story title cannot be empty")
 	}
-
-	tx, err := db.Begin()
+	tx, err := db.conn.Begin()
 	if err != nil {
 		return nil, fmt.Errorf("starting transaction: %w", err)
 	}
-	defer tx.Rollback() //nolint:errcheck — Rollback is a no-op after Commit
+	defer tx.Rollback() //nolint:errcheck
 
-	slug, err := db.nextStorySlug(projectID)
+	storySlug, err := db.nextSlug(tx, "S", "stories", "slug", projectID)
 	if err != nil {
 		return nil, err
 	}
-
 	res, err := tx.Exec(
 		`INSERT INTO stories (project_id, slug, title, description, acceptance_criteria) VALUES (?, ?, ?, ?, ?)`,
-		projectID, slug, title, description, acJSON,
+		projectID, storySlug, title, description, acJSON,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("inserting story: %w", err)
@@ -186,7 +218,7 @@ func (db *DB) PersistStory(projectID int64, title, description, acJSON string, t
 	storyID, _ := res.LastInsertId()
 
 	for _, t := range tasks {
-		taskSlug, err := db.nextTaskSlugTx(tx, projectID)
+		taskSlug, err := db.nextSlug(tx, "T", "tasks", "slug", projectID)
 		if err != nil {
 			return nil, err
 		}
@@ -213,41 +245,31 @@ func (db *DB) PersistStory(projectID int64, title, description, acJSON string, t
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("committing story: %w", err)
 	}
-
 	return db.GetStoryByID(storyID)
 }
 
-// nextTaskSlugTx derives the next task slug within an open transaction.
-func (db *DB) nextTaskSlugTx(tx *sql.Tx, projectID int64) (string, error) {
-	var maxN sql.NullInt64
-	err := tx.QueryRow(
-		`SELECT MAX(CAST(REPLACE(t.slug, 'T-', '') AS INTEGER))
-         FROM tasks t
-         JOIN stories s ON s.id = t.story_id
-         WHERE s.project_id = ?`, projectID,
-	).Scan(&maxN)
-	if err != nil {
-		return "", err
-	}
-	n := int64(0)
-	if maxN.Valid {
-		n = maxN.Int64
-	}
-	return fmt.Sprintf("T-%d", n+1), nil
-}
-
 func (db *DB) GetStoryByID(id int64) (*Story, error) {
-	return scanStory(db.QueryRow(`SELECT `+storySelectCols+` FROM stories WHERE id = ?`, id))
+	s, err := scanStory(db.conn.QueryRow(`SELECT `+storySelectCols+` FROM stories WHERE id = ?`, id))
+	if err != nil {
+		return nil, fmt.Errorf("story id=%d: %w", id, err)
+	}
+	return s, nil
 }
 
 func (db *DB) GetStoryBySlug(projectID int64, slug string) (*Story, error) {
-	return scanStory(db.QueryRow(
+	s, err := scanStory(db.conn.QueryRow(
 		`SELECT `+storySelectCols+` FROM stories WHERE project_id = ? AND slug = ?`, projectID, slug,
 	))
+	if err != nil {
+		return nil, fmt.Errorf("story %q: %w", slug, err)
+	}
+	return s, nil
 }
 
 func (db *DB) ListStories(projectID int64) ([]*Story, error) {
-	rows, err := db.Query(`SELECT `+storySelectCols+` FROM stories WHERE project_id = ? ORDER BY id`, projectID)
+	rows, err := db.conn.Query(
+		`SELECT `+storySelectCols+` FROM stories WHERE project_id = ? ORDER BY id`, projectID,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -265,17 +287,23 @@ func (db *DB) ListStories(projectID int64) ([]*Story, error) {
 }
 
 func (db *DB) SetStoryStatus(projectID int64, slug, status string) error {
-	_, err := db.Exec(
+	res, err := db.conn.Exec(
 		`UPDATE stories SET status = ? WHERE project_id = ? AND slug = ?`, status, projectID, slug,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	return requireOneRow(res, "story", slug)
 }
 
 func (db *DB) DeleteStory(projectID int64, slug string) error {
-	_, err := db.Exec(
+	res, err := db.conn.Exec(
 		`DELETE FROM stories WHERE project_id = ? AND slug = ?`, projectID, slug,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	return requireOneRow(res, "story", slug)
 }
 
 func scanStory(s interface{ Scan(...any) error }) (*Story, error) {
@@ -283,7 +311,7 @@ func scanStory(s interface{ Scan(...any) error }) (*Story, error) {
 	err := s.Scan(&st.ID, &st.ProjectID, &st.Slug, &st.Title,
 		&st.Description, &st.AcceptanceCriteria, &st.Status, &st.CreatedAt)
 	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("story not found")
+		return nil, fmt.Errorf("not found")
 	}
 	return st, err
 }
@@ -300,21 +328,17 @@ type Task struct {
 	UpdatedAt time.Time
 }
 
-func (db *DB) CreateTask(storyID int64, title string) (*Task, error) {
+// CreateTask creates a task under storyID within projectID.
+// projectID is passed explicitly to avoid an extra lookup for slug generation.
+func (db *DB) CreateTask(projectID, storyID int64, title string) (*Task, error) {
 	if title == "" {
 		return nil, fmt.Errorf("task title cannot be empty")
 	}
-	var projectID int64
-	if err := db.QueryRow(`SELECT project_id FROM stories WHERE id = ?`, storyID).Scan(&projectID); err != nil {
-		return nil, fmt.Errorf("finding story for task: %w", err)
-	}
-
-	slug, err := db.nextTaskSlugDirect(projectID)
+	slug, err := db.nextSlug(db.conn, "T", "tasks", "slug", projectID)
 	if err != nil {
 		return nil, err
 	}
-
-	res, err := db.Exec(`INSERT INTO tasks (story_id, slug, title) VALUES (?, ?, ?)`, storyID, slug, title)
+	res, err := db.conn.Exec(`INSERT INTO tasks (story_id, slug, title) VALUES (?, ?, ?)`, storyID, slug, title)
 	if err != nil {
 		return nil, err
 	}
@@ -322,39 +346,28 @@ func (db *DB) CreateTask(storyID int64, title string) (*Task, error) {
 	return db.GetTaskByID(id)
 }
 
-// nextTaskSlugDirect derives the next task slug using a direct DB connection.
-func (db *DB) nextTaskSlugDirect(projectID int64) (string, error) {
-	var maxN sql.NullInt64
-	err := db.QueryRow(
-		`SELECT MAX(CAST(REPLACE(t.slug, 'T-', '') AS INTEGER))
-         FROM tasks t
-         JOIN stories s ON s.id = t.story_id
-         WHERE s.project_id = ?`, projectID,
-	).Scan(&maxN)
-	if err != nil {
-		return "", err
-	}
-	n := int64(0)
-	if maxN.Valid {
-		n = maxN.Int64
-	}
-	return fmt.Sprintf("T-%d", n+1), nil
-}
-
 func (db *DB) GetTaskByID(id int64) (*Task, error) {
-	return scanTask(db.QueryRow(`SELECT `+taskSelectCols+` FROM tasks WHERE id = ?`, id))
+	t, err := scanTask(db.conn.QueryRow(`SELECT `+taskSelectCols+` FROM tasks WHERE id = ?`, id))
+	if err != nil {
+		return nil, fmt.Errorf("task id=%d: %w", id, err)
+	}
+	return t, nil
 }
 
 func (db *DB) GetTaskBySlug(projectID int64, slug string) (*Task, error) {
-	return scanTask(db.QueryRow(
+	t, err := scanTask(db.conn.QueryRow(
 		`SELECT t.`+taskSelectCols+`
          FROM tasks t JOIN stories s ON s.id = t.story_id
          WHERE s.project_id = ? AND t.slug = ?`, projectID, slug,
 	))
+	if err != nil {
+		return nil, fmt.Errorf("task %q: %w", slug, err)
+	}
+	return t, nil
 }
 
 func (db *DB) ListTasksForStory(storyID int64) ([]*Task, error) {
-	rows, err := db.Query(
+	rows, err := db.conn.Query(
 		`SELECT `+taskSelectCols+` FROM tasks WHERE story_id = ? ORDER BY id`, storyID,
 	)
 	if err != nil {
@@ -374,27 +387,33 @@ func (db *DB) ListTasksForStory(storyID int64) ([]*Task, error) {
 }
 
 func (db *DB) SetTaskStatus(projectID int64, slug, status string) error {
-	_, err := db.Exec(
+	res, err := db.conn.Exec(
 		`UPDATE tasks SET status = ?, updated_at = datetime('now')
          WHERE slug = ? AND story_id IN (SELECT id FROM stories WHERE project_id = ?)`,
 		status, slug, projectID,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	return requireOneRow(res, "task", slug)
 }
 
 func (db *DB) DeleteTask(projectID int64, slug string) error {
-	_, err := db.Exec(
+	res, err := db.conn.Exec(
 		`DELETE FROM tasks WHERE slug = ? AND story_id IN (SELECT id FROM stories WHERE project_id = ?)`,
 		slug, projectID,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	return requireOneRow(res, "task", slug)
 }
 
 func scanTask(s interface{ Scan(...any) error }) (*Task, error) {
 	t := &Task{}
 	err := s.Scan(&t.ID, &t.StoryID, &t.Slug, &t.Title, &t.Status, &t.CreatedAt, &t.UpdatedAt)
 	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("task not found")
+		return nil, fmt.Errorf("not found")
 	}
 	return t, err
 }
@@ -410,42 +429,37 @@ type Subtask struct {
 	CreatedAt time.Time
 }
 
-// CreateSubtask derives the next subtask slug in a single query that fetches
-// both the existing count and the parent task's slug.
+// CreateSubtask derives the next subtask slug in a single query.
 func (db *DB) CreateSubtask(taskID int64, title string) (*Subtask, error) {
 	if title == "" {
 		return nil, fmt.Errorf("subtask title cannot be empty")
 	}
-
 	var taskSlug string
 	var count int
-	err := db.QueryRow(
+	err := db.conn.QueryRow(
 		`SELECT t.slug, COUNT(su.id)
-         FROM tasks t
-         LEFT JOIN subtasks su ON su.task_id = t.id
-         WHERE t.id = ?
-         GROUP BY t.id, t.slug`,
-		taskID,
+         FROM tasks t LEFT JOIN subtasks su ON su.task_id = t.id
+         WHERE t.id = ? GROUP BY t.id, t.slug`, taskID,
 	).Scan(&taskSlug, &count)
 	if err != nil {
 		return nil, fmt.Errorf("finding task for subtask: %w", err)
 	}
 
 	slug := fmt.Sprintf("%s.%d", taskSlug, count+1)
-	res, err := db.Exec(`INSERT INTO subtasks (task_id, slug, title) VALUES (?, ?, ?)`, taskID, slug, title)
+	res, err := db.conn.Exec(`INSERT INTO subtasks (task_id, slug, title) VALUES (?, ?, ?)`, taskID, slug, title)
 	if err != nil {
 		return nil, err
 	}
 	id, _ := res.LastInsertId()
 
 	st := &Subtask{}
-	return st, db.QueryRow(
+	return st, db.conn.QueryRow(
 		`SELECT id, task_id, slug, title, status, created_at FROM subtasks WHERE id = ?`, id,
 	).Scan(&st.ID, &st.TaskID, &st.Slug, &st.Title, &st.Status, &st.CreatedAt)
 }
 
 func (db *DB) ListSubtasksForTask(taskID int64) ([]*Subtask, error) {
-	rows, err := db.Query(
+	rows, err := db.conn.Query(
 		`SELECT id, task_id, slug, title, status, created_at FROM subtasks WHERE task_id = ? ORDER BY id`, taskID,
 	)
 	if err != nil {
@@ -465,7 +479,7 @@ func (db *DB) ListSubtasksForTask(taskID int64) ([]*Subtask, error) {
 }
 
 func (db *DB) SetSubtaskStatus(taskID int64, slug, status string) error {
-	_, err := db.Exec(
+	_, err := db.conn.Exec(
 		`UPDATE subtasks SET status = ? WHERE task_id = ? AND slug = ?`, status, taskID, slug,
 	)
 	return err
@@ -526,11 +540,10 @@ type ProjectStats struct {
 }
 
 // GetProjectStats fetches all counts in a single SQL query.
-// COUNT(DISTINCT CASE WHEN ...) handles the LEFT JOIN fanout correctly —
-// plain SUM would over-count rows multiplied by the subtask join.
+// COUNT(DISTINCT CASE WHEN …) handles the LEFT JOIN fanout correctly.
 func (db *DB) GetProjectStats(projectID int64) (*ProjectStats, error) {
 	s := &ProjectStats{}
-	err := db.QueryRow(`
+	err := db.conn.QueryRow(`
 		SELECT
 			COUNT(DISTINCT st.id),
 			COUNT(DISTINCT CASE WHEN st.status = 'done' THEN st.id END),
@@ -548,4 +561,18 @@ func (db *DB) GetProjectStats(projectID int64) (*ProjectStats, error) {
 		&s.TotalSubtasks, &s.DoneSubtasks,
 	)
 	return s, err
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+// requireOneRow returns an error if the result affected zero rows.
+func requireOneRow(res sql.Result, kind, slug string) error {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("%s %q not found", kind, slug)
+	}
+	return nil
 }

@@ -107,7 +107,9 @@ func buildPayload(proj *db.Project, views []*db.StoryView) exportPayload {
 		}
 		for _, t := range v.Tasks {
 			to := taskOut{Slug: t.Slug, Title: t.Title, Status: t.Status}
-			for _, st := range v.Subtasks[t.ID] {
+			subList := v.Subtasks[t.ID]
+			to.Subtasks = make([]subtaskOut, 0, len(subList))
+			for _, st := range subList {
 				to.Subtasks = append(to.Subtasks, subtaskOut{Slug: st.Slug, Title: st.Title, Status: st.Status})
 			}
 			so.Tasks = append(so.Tasks, to)
@@ -117,15 +119,16 @@ func buildPayload(proj *db.Project, views []*db.StoryView) exportPayload {
 	return out
 }
 
-// parseCriteria unmarshals a JSON acceptance-criteria string. Returns nil (not
-// an empty slice) on empty or invalid input so callers can check len() safely.
+// parseCriteria unmarshals a JSON acceptance-criteria string.
+// Always returns a non-nil slice (empty on invalid/missing input)
+// so callers can use len() without nil-checking.
 func parseCriteria(raw string) []string {
 	if raw == "" {
-		return nil
+		return []string{}
 	}
 	var out []string
 	if err := json.Unmarshal([]byte(raw), &out); err != nil {
-		return nil
+		return []string{}
 	}
 	return out
 }

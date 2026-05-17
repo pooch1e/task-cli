@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/joelkram/task-cli/internal/config"
 	"github.com/joelkram/task-cli/internal/db"
@@ -57,7 +58,7 @@ func initCmd() *cobra.Command {
 				return err
 			}
 			defer app.Close()
-			ui.Success(fmt.Sprintf("Project %q initialised  %s", app.Project.Name, app.Root))
+			ui.Success(fmt.Sprintf("Project %q initialised  %s", app.Project.Name, app.Project.Path))
 			return nil
 		},
 	}
@@ -123,7 +124,11 @@ func storyCmd() *cobra.Command {
 				}
 			}
 
-			gen, err := llm.New(cfg).GenerateStory(llm.StoryRequest{
+			client, err := llm.New(cfg)
+			if err != nil {
+				return fmt.Errorf("invalid provider: %w", err)
+			}
+			gen, err := client.GenerateStory(llm.StoryRequest{
 				Feature:     feature,
 				ProjectName: app.Project.Name,
 			})
@@ -173,7 +178,6 @@ func listCmd() *cobra.Command {
 					return fmt.Errorf("project %q not found", projectName)
 				}
 				app.Project = p
-				app.Root = p.Path
 			}
 
 			views, err := app.DB.LoadProjectView(app.Project.ID)
@@ -181,7 +185,7 @@ func listCmd() *cobra.Command {
 				return err
 			}
 
-			ui.PrintProject(app.Project.Name, app.Root)
+			ui.PrintProject(app.Project.Name, app.Project.Path)
 			if len(views) == 0 {
 				ui.Info("No stories yet. Run: task story \"<feature>\"")
 				return nil
@@ -245,7 +249,7 @@ func statusCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			ui.PrintProject(app.Project.Name, app.Root)
+			ui.PrintProject(app.Project.Name, app.Project.Path)
 			ui.PrintStats(stats)
 			return nil
 		},
@@ -276,8 +280,8 @@ func startCmd() *cobra.Command {
 func setStatus(status string) func(*cobra.Command, []string) error {
 	return func(cmd *cobra.Command, args []string) error {
 		slug := args[0]
-		if len(slug) < 2 {
-			return fmt.Errorf("invalid slug %q — expected S-N or T-N", slug)
+		if err := validateSlug(slug); err != nil {
+			return err
 		}
 		app, err := openAppContext()
 		if err != nil {
@@ -319,7 +323,7 @@ func addCmd() *cobra.Command {
 				return s.ID, nil
 			},
 			create: func(app *AppContext, parentID int64, title string) (string, string, error) {
-				t, err := app.DB.CreateTask(parentID, title)
+				t, err := app.DB.CreateTask(app.Project.ID, parentID, title)
 				if err != nil {
 					return "", "", err
 				}
@@ -400,14 +404,16 @@ func rmCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			slug := args[0]
-			if len(slug) < 2 {
-				return fmt.Errorf("invalid slug %q", slug)
+			if err := validateSlug(slug); err != nil {
+				return err
 			}
 			if !yes {
+				if !ui.IsTTY() {
+					return fmt.Errorf("non-interactive terminal: use --yes to confirm removal of %s", slug)
+				}
 				fmt.Printf("Remove %s and all its children? [y/N] ", slug)
 				var confirm string
-				fmt.Scanln(&confirm) //nolint:errcheck
-				if confirm != "y" && confirm != "Y" {
+				if _, err := fmt.Scanln(&confirm); err != nil || (confirm != "y" && confirm != "Y") {
 					ui.Info("Aborted.")
 					return nil
 				}
@@ -475,8 +481,10 @@ func exportCmd() *cobra.Command {
 			switch format {
 			case "json":
 				err = export.ToJSON(w, app.Project, views)
-			default:
+			case "markdown":
 				err = export.ToMarkdown(w, app.Project, views)
+			default:
+				return fmt.Errorf("unknown format %q — use markdown or json", format)
 			}
 			if err != nil {
 				return err
@@ -505,7 +513,7 @@ func providersCmd() *cobra.Command {
 
 			fmt.Printf("\n  %-12s  %-32s  %-14s  %-20s  %s\n",
 				"Provider", "Default model", "Cost/1K in", "Key required", "Notes")
-			fmt.Printf("  %s\n", ui.Dimmed(repeat("-", 100)))
+			fmt.Printf("  %s\n", ui.Dimmed(strings.Repeat("-", 100)))
 
 			for _, p := range config.KnownProviders {
 				marker := "  "
@@ -615,7 +623,12 @@ func configTestCmd() *cobra.Command {
 				return nil
 			}
 			ui.Info(fmt.Sprintf("Testing %s / %s …", cfg.LLM.Provider, cfg.LLM.Model))
-			if err := llm.New(cfg).Ping(); err != nil {
+			client, err := llm.New(cfg)
+			if err != nil {
+				ui.Error(err.Error())
+				return nil
+			}
+			if err := client.Ping(); err != nil {
 				ui.Error(fmt.Sprintf("Connection failed: %s", err))
 				return nil
 			}
@@ -657,19 +670,19 @@ func printOnboarding() {
 	fmt.Println()
 }
 
-// truncate shortens s to maxLen, appending … if truncated.
+// truncate shortens s to at most maxLen runes, appending … if truncated.
+// maxLen must be ≥2; values below that return s unchanged.
 func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
+	if maxLen < 2 || len(s) <= maxLen {
 		return s
 	}
 	return s[:maxLen-1] + "…"
 }
 
-// repeat returns a string of n copies of char.
-func repeat(char string, n int) string {
-	out := make([]byte, 0, len(char)*n)
-	for i := 0; i < n; i++ {
-		out = append(out, char...)
+// validateSlug returns an error if s is not a valid S-N or T-N slug.
+func validateSlug(s string) error {
+	if len(s) < 2 || (s[0] != 'S' && s[0] != 'T') || s[1] != '-' {
+		return fmt.Errorf("invalid slug %q — expected S-N or T-N", s)
 	}
-	return string(out)
+	return nil
 }

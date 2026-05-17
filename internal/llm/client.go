@@ -1,9 +1,10 @@
 package llm
 
-import "github.com/joelkram/task-cli/internal/config"
+import (
+	"fmt"
 
-// Note: provider name constants live in the config package to avoid a circular
-// import (llm already imports config).
+	"github.com/joelkram/task-cli/internal/config"
+)
 
 // StoryRequest is what the user provides to kick off generation.
 type StoryRequest struct {
@@ -28,21 +29,25 @@ type GeneratedStory struct {
 type Client interface {
 	// GenerateStory calls the LLM and returns a parsed story with tasks.
 	GenerateStory(req StoryRequest) (*GeneratedStory, error)
-	// Ping performs a lightweight health check: verifies credentials and
-	// connectivity without generating a full story.
+	// Ping performs a lightweight health check without generating a story.
 	Ping() error
 }
 
-// New returns the right Client based on the provider in cfg.
-func New(cfg *config.Config) Client {
+// New returns the Client for the provider named in cfg.
+// Returns an error for unknown provider names so typos surface immediately
+// rather than silently falling through to a wrong provider.
+func New(cfg *config.Config) (Client, error) {
 	switch cfg.LLM.Provider {
 	case config.ProviderPi:
-		return PiClient(cfg)
+		return PiClient(cfg), nil
 	case config.ProviderOpencode:
-		return OpencodeClient(cfg)
+		return OpencodeClient(cfg), nil
 	case config.ProviderGemini:
-		return newGeminiClient(cfg)
+		return newGeminiClient(cfg), nil
+	case "deepseek", "openai", "":
+		// All OpenAI-compatible endpoints share one client.
+		return newOpenAIClient(cfg), nil
 	default:
-		return newOpenAIClient(cfg)
+		return nil, fmt.Errorf("unknown LLM provider %q — run: task providers", cfg.LLM.Provider)
 	}
 }

@@ -11,7 +11,7 @@ import (
 
 const progressBarWidth = 20
 
-// ANSI colour helpers — disabled automatically on non-TTY stdout.
+// ANSI colour codes — suppressed automatically on non-TTY stdout.
 const (
 	ansiReset  = "\033[0m"
 	ansiBold   = "\033[1m"
@@ -24,8 +24,8 @@ const (
 	ansiBlue   = "\033[34m"
 )
 
-// isTTY reports whether stdout is an interactive terminal.
-func isTTY() bool {
+// IsTTY reports whether stdout is an interactive terminal.
+func IsTTY() bool {
 	fi, err := os.Stdout.Stat()
 	if err != nil {
 		return false
@@ -34,14 +34,20 @@ func isTTY() bool {
 }
 
 func color(code, s string) string {
-	if !isTTY() {
+	if !IsTTY() {
 		return s
 	}
 	return code + s + ansiReset
 }
 
-func b(s string) string     { return color(ansiBold, s) }
-func dimS(s string) string  { return color(ansiDim+ansiGrey, s) }
+// bold wraps s in ANSI bold.
+func bold(s string) string { return color(ansiBold, s) }
+
+// dimGrey wraps s in ANSI dim+grey.
+func dimGrey(s string) string { return color(ansiDim+ansiGrey, s) }
+
+// Dimmed is the exported form of dimGrey for use outside this package.
+func Dimmed(s string) string { return dimGrey(s) }
 
 func statusIcon(status string) string {
 	switch status {
@@ -58,19 +64,19 @@ func statusIcon(status string) string {
 
 // PrintProject prints the project header.
 func PrintProject(name, path string) {
-	fmt.Printf("\n%s  %s\n", b(color(ansiCyan, "◆ "+name)), dimS(path))
-	fmt.Println(dimS(strings.Repeat("─", 60)))
+	fmt.Printf("\n%s  %s\n", bold(color(ansiCyan, "◆ "+name)), dimGrey(path))
+	fmt.Println(dimGrey(strings.Repeat("─", 60)))
 }
 
 // PrintStory prints a story and all its tasks/subtasks from a StoryView.
 func PrintStory(v *db.StoryView) {
 	s := v.Story
-	fmt.Printf("\n  %s  %s  %s\n", statusIcon(s.Status), b(color(ansiBlue, s.Slug)), b(s.Title))
+	fmt.Printf("\n  %s  %s  %s\n", statusIcon(s.Status), bold(color(ansiBlue, s.Slug)), bold(s.Title))
 	if s.Description != "" {
-		fmt.Printf("       %s\n", dimS(s.Description))
+		fmt.Printf("       %s\n", dimGrey(s.Description))
 	}
 	if len(v.Tasks) == 0 {
-		fmt.Printf("       %s\n", dimS("no tasks yet"))
+		fmt.Printf("       %s\n", dimGrey("no tasks yet"))
 		return
 	}
 	for _, t := range v.Tasks {
@@ -82,7 +88,7 @@ func printTask(t *db.Task, subtasks []*db.Subtask) {
 	fmt.Printf("       %s  %s  %s\n", statusIcon(t.Status), color(ansiYellow, t.Slug), t.Title)
 	for _, st := range subtasks {
 		fmt.Printf("              %s  %s  %s\n",
-			statusIcon(st.Status), color(ansiGrey, st.Slug), dimS(st.Title))
+			statusIcon(st.Status), color(ansiGrey, st.Slug), dimGrey(st.Title))
 	}
 }
 
@@ -115,7 +121,7 @@ func PrintStats(stats *db.ProjectStats) {
 
 func printBar(label string, done, total int, clr string) {
 	if total == 0 {
-		fmt.Printf("  %s  %s\n", b(label), dimS("none"))
+		fmt.Printf("  %s  %s\n", bold(label), dimGrey("none"))
 		return
 	}
 	if done > total {
@@ -123,12 +129,12 @@ func printBar(label string, done, total int, clr string) {
 	}
 	filled := (done * progressBarWidth) / total
 	bar := color(clr, strings.Repeat("█", filled)) +
-		dimS(strings.Repeat("░", progressBarWidth-filled))
+		dimGrey(strings.Repeat("░", progressBarWidth-filled))
 	pct := (done * 100) / total
 	fmt.Printf("  %s  [%s] %s%d%%%s %s\n",
-		b(label), bar,
+		bold(label), bar,
 		ansiBold, pct, ansiReset,
-		dimS(fmt.Sprintf("%d/%d", done, total)),
+		dimGrey(fmt.Sprintf("%d/%d", done, total)),
 	)
 }
 
@@ -137,6 +143,3 @@ func Success(msg string) { fmt.Printf("%s %s\n", color(ansiGreen, "✓"), msg) }
 func Error(msg string)   { fmt.Printf("%s %s\n", color(ansiRed, "✗"), msg) }
 func Info(msg string)    { fmt.Printf("%s %s\n", color(ansiCyan, "ℹ"), msg) }
 func Warn(msg string)    { fmt.Printf("%s %s\n", color(ansiYellow, "⚠"), msg) }
-
-// Dimmed returns s styled as dim/grey text (or plain text on non-TTY).
-func Dimmed(s string) string { return dimS(s) }

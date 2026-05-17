@@ -115,8 +115,13 @@ func Save(cfg *Config) error {
 }
 
 // Default returns a config with sensible defaults and no API key.
+// If the home directory cannot be resolved, the DB path falls back to the
+// OS temp directory rather than producing a silently invalid empty path.
 func Default() *Config {
-	dir, _ := Dir()
+	dir, err := Dir()
+	if err != nil {
+		dir = os.TempDir()
+	}
 	return &Config{
 		LLM: LLMConfig{
 			Provider:    "deepseek",
@@ -145,7 +150,6 @@ func (c *Config) applyDefaults() {
 			c.LLM.BaseURL = meta.DefaultBaseURL
 		}
 	} else {
-		// Unknown provider — use deepseek as a safe fallback.
 		d := Default()
 		if c.LLM.Provider == "" {
 			c.LLM.Provider = d.LLM.Provider
@@ -164,7 +168,10 @@ func (c *Config) applyDefaults() {
 		c.LLM.TimeoutSecs = 30
 	}
 	if c.Storage.DBPath == "" {
-		dir, _ := Dir()
+		dir, err := Dir()
+		if err != nil {
+			dir = os.TempDir()
+		}
 		c.Storage.DBPath = filepath.Join(dir, "tasks.db")
 	}
 }
@@ -180,12 +187,10 @@ func (c *Config) applyEnvOverrides() {
 	if v := os.Getenv("TASK_API_KEY"); v != "" {
 		c.LLM.APIKey = v
 	}
-	// Provider-specific key env vars (checked only if TASK_API_KEY not set).
+	// Provider-specific key env var — checked only if TASK_API_KEY is not set.
 	if c.LLM.APIKey == "" {
-		if meta := LookupProvider(c.LLM.Provider); meta != nil && meta.KeyEnvVar != "" {
-			if v := os.Getenv(meta.KeyEnvVar); v != "" {
-				c.LLM.APIKey = v
-			}
+		if v := getAPIKeyFromEnv(c.LLM.Provider); v != "" {
+			c.LLM.APIKey = v
 		}
 	}
 	if v := os.Getenv("TASK_PROVIDER"); v != "" {
@@ -197,6 +202,16 @@ func (c *Config) applyEnvOverrides() {
 	if v := os.Getenv("TASK_BASE_URL"); v != "" {
 		c.LLM.BaseURL = v
 	}
+}
+
+// getAPIKeyFromEnv returns the value of the provider-specific API key env var,
+// or empty string if the provider has no key var or the var is unset.
+func getAPIKeyFromEnv(provider string) string {
+	meta := LookupProvider(provider)
+	if meta == nil || meta.KeyEnvVar == "" || meta.KeyEnvVar == "TASK_API_KEY" {
+		return ""
+	}
+	return os.Getenv(meta.KeyEnvVar)
 }
 
 // Validate returns an error if required fields are missing for the chosen provider.

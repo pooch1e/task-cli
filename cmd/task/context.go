@@ -10,16 +10,15 @@ import (
 
 // AppContext holds the shared state every command needs.
 // Create with openAppContext; always defer Close.
+// Project.Path holds the detected repo root — no separate Root field.
 type AppContext struct {
 	Config  *config.Config
 	DB      *db.DB
 	Project *db.Project
-	Root    string
 }
 
 // openAppContext loads config, opens the database, and detects the current
-// project. Returns an error rather than calling os.Exit so cobra can surface
-// it cleanly.
+// project. Returns an error rather than calling os.Exit so cobra surfaces it.
 func openAppContext() (*AppContext, error) {
 	cfg, err := config.LoadOrDefault()
 	if err != nil {
@@ -43,7 +42,7 @@ func openAppContext() (*AppContext, error) {
 		return nil, fmt.Errorf("upserting project %q: %w", name, err)
 	}
 
-	return &AppContext{Config: cfg, DB: d, Project: p, Root: root}, nil
+	return &AppContext{Config: cfg, DB: d, Project: p}, nil
 }
 
 // Close releases the database connection.

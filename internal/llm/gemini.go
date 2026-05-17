@@ -76,7 +76,7 @@ func (c *GeminiClient) call(ctx context.Context, parts PromptParts) (string, err
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("Gemini request failed: %w", err)
+		return "", fmt.Errorf("Gemini request failed: %s", sanitizeErrorMsg(err.Error(), c.cfg.LLM.APIKey))
 	}
 	defer resp.Body.Close()
 

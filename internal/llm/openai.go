@@ -13,9 +13,7 @@ import (
 	"github.com/joelkram/task-cli/internal/config"
 )
 
-// maxResponseBytes caps the LLM response body read. Exceeding this returns an
-// explicit error rather than silently truncating.
-const maxResponseBytes = 64 * 1024
+// maxResponseBytes is defined in limits.go — shared across all providers.
 
 // OpenAIClient works with DeepSeek, OpenAI, and any OpenAI-compatible endpoint.
 type OpenAIClient struct {
@@ -66,7 +64,7 @@ func (c *OpenAIClient) call(ctx context.Context, parts PromptParts) (string, err
 
 	req, err := http.NewRequestWithContext(
 		ctx, http.MethodPost,
-		c.cfg.LLM.BaseURL+"/chat/completions",
+		strings.TrimRight(c.cfg.LLM.BaseURL, "/")+"/chat/completions",
 		bytes.NewReader(raw),
 	)
 	if err != nil {

@@ -4,6 +4,7 @@ package ratelimit
 
 import (
 	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
 	"time"
@@ -48,7 +49,8 @@ func readTimestamps(path string) ([]time.Time, error) {
 	}
 	var stamps []time.Time
 	if err := json.Unmarshal(data, &stamps); err != nil {
-		// Corrupt file — treat as empty rather than blocking the user.
+		// Corrupt file — reset rather than blocking the user, but log it.
+		log.Printf("warning: ratelimit state corrupt, resetting (%v)", err)
 		return nil, nil
 	}
 	return stamps, nil
