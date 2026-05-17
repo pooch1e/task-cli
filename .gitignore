@@ -1,0 +1,13 @@
+task
+dist/
+*.db
+*.db-shm
+*.db-wal
+
+# Editors
+.DS_Store
+.idea/
+.vscode/
+
+# Config — never commit your API key
+~/.task/config.toml
