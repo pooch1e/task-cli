@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write  # required to create GitHub Releases and upload assets
+
+jobs:
+  release:
+    name: Build and release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so git describe works correctly
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: Build release binaries
+        run: make release
+        env:
+          VERSION: ${{ github.ref_name }}
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum task-* > checksums.txt
+          echo "=== checksums ==="
+          cat checksums.txt
+
+      - name: Create GitHub Release
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "task-cli ${{ github.ref_name }}" \
+            --generate-notes \
+            dist/task-darwin-arm64 \
+            dist/task-darwin-amd64 \
+            dist/task-linux-amd64 \
+            dist/checksums.txt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

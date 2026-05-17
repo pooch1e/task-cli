@@ -15,6 +15,13 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// version is set at build time via:
+//
+//	go build -ldflags "-X main.version=$(git describe --tags --always)"
+//
+// Falls back to "dev" when built without the flag.
+var version = "dev"
+
 func main() {
 	if err := rootCmd().Execute(); err != nil {
 		os.Exit(1)
@@ -42,6 +49,7 @@ func rootCmd() *cobra.Command {
 		exportCmd(),
 		providersCmd(),
 		configCmd(),
+		versionCmd(),
 	)
 	return cmd
 }
@@ -634,6 +642,18 @@ func configTestCmd() *cobra.Command {
 			}
 			ui.Success("Connection OK")
 			return nil
+		},
+	}
+}
+
+// ── version ────────────────────────────────────────────────────────────────
+
+func versionCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "version",
+		Short: "Print the task-cli version",
+		Run: func(cmd *cobra.Command, args []string) {
+			fmt.Printf("task-cli %s\n", version)
 		},
 	}
 }
