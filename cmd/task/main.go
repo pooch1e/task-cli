@@ -7,8 +7,8 @@ import (
 
 	"github.com/joelkram/task-cli/internal/config"
 	"github.com/joelkram/task-cli/internal/db"
+	"github.com/joelkram/task-cli/internal/export"
 	"github.com/joelkram/task-cli/internal/llm"
-	"github.com/joelkram/task-cli/internal/project"
 	"github.com/joelkram/task-cli/internal/ui"
 	"github.com/spf13/cobra"
 )
@@ -26,6 +26,19 @@ func rootCmd() *cobra.Command {
 		Use:   "task",
 		Short: "Personal user story and task tracker",
 		Long:  "Track user stories, tasks and subtasks for your projects.\nPowered by LLM story generation via DeepSeek, pi, or opencode.",
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			// First-run onboarding: detect missing config + missing env key
+			// Skip for config subcommands which are meant to fix this state
+			if cmd.Name() == "init" || cmd.Parent().Name() == "config" {
+				return nil
+			}
+			_, cfgErr := config.Load()
+			if cfgErr == config.ErrNotFound && os.Getenv("TASK_API_KEY") == "" {
+				printOnboarding()
+				// Don't block — allow commands to run with defaults
+			}
+			return nil
+		},
 	}
 
 	cmd.AddCommand(
@@ -37,39 +50,12 @@ func rootCmd() *cobra.Command {
 		doneCmd(),
 		startCmd(),
 		addCmd(),
+		rmCmd(),
+		exportCmd(),
 		configCmd(),
 	)
 
 	return cmd
-}
-
-// ── shared helpers ────────────────────────────────────────────────────────────
-
-func mustOpenDB() *db.DB {
-	cfg, err := config.Load()
-	if err == config.ErrNotFound {
-		cfg = config.Default()
-	} else if err != nil {
-		ui.Error(err.Error())
-		os.Exit(1)
-	}
-
-	d, err := db.Open(cfg.Storage.DBPath)
-	if err != nil {
-		ui.Error(fmt.Sprintf("opening database: %s", err))
-		os.Exit(1)
-	}
-	return d
-}
-
-func mustProject(d *db.DB) (*db.Project, string) {
-	name, root := project.Detect()
-	p, err := d.UpsertProject(name, root)
-	if err != nil {
-		ui.Error(fmt.Sprintf("detecting project: %s", err))
-		os.Exit(1)
-	}
-	return p, root
 }
 
 // ── init ──────────────────────────────────────────────────────────────────────
@@ -79,11 +65,12 @@ func initCmd() *cobra.Command {
 		Use:   "init",
 		Short: "Initialise task for the current project",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			d := mustOpenDB()
-			defer d.Close()
-
-			p, root := mustProject(d)
-			ui.Success(fmt.Sprintf("Project %q initialised  %s", p.Name, root))
+			app, err := openAppContext()
+			if err != nil {
+				return err
+			}
+			defer app.Close()
+			ui.Success(fmt.Sprintf("Project %q initialised  %s", app.Project.Name, app.Root))
 			return nil
 		},
 	}
@@ -93,8 +80,7 @@ func initCmd() *cobra.Command {
 
 func storyCmd() *cobra.Command {
 	var dryRun bool
-	var agent string
-	var model string
+	var agent, model string
 
 	cmd := &cobra.Command{
 		Use:   "story <feature description>",
@@ -103,12 +89,10 @@ func storyCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			feature := args[0]
 
-			cfg, err := loadOrDefault()
+			cfg, err := config.LoadOrDefault()
 			if err != nil {
 				return err
 			}
-
-			// flag overrides
 			if agent != "" {
 				cfg.LLM.Provider = agent
 			}
@@ -117,10 +101,9 @@ func storyCmd() *cobra.Command {
 			}
 
 			if dryRun {
-				req := llm.StoryRequest{Feature: feature, ProjectName: "preview"}
 				fmt.Println("── Dry run ──")
 				fmt.Printf("Provider: %s   Model: %s\n\n", cfg.LLM.Provider, cfg.LLM.Model)
-				fmt.Println(llm.BuildPrompt(req))
+				fmt.Println(llm.BuildPrompt(llm.StoryRequest{Feature: feature, ProjectName: "preview"}))
 				return nil
 			}
 
@@ -130,55 +113,34 @@ func storyCmd() *cobra.Command {
 				return nil
 			}
 
-			d := mustOpenDB()
-			defer d.Close()
-
-			p, _ := mustProject(d)
+			app, err := openAppContext()
+			if err != nil {
+				return err
+			}
+			defer app.Close()
 
 			ui.Info(fmt.Sprintf("Generating story for %q using %s/%s …", feature, cfg.LLM.Provider, cfg.LLM.Model))
 
-			client := llm.New(cfg)
-			gen, err := client.GenerateStory(llm.StoryRequest{
+			gen, err := llm.New(cfg).GenerateStory(llm.StoryRequest{
 				Feature:     feature,
-				ProjectName: p.Name,
+				ProjectName: app.Project.Name,
 			})
 			if err != nil {
 				return fmt.Errorf("LLM generation failed: %w", err)
 			}
 
-			// Persist to DB
-			acJSON, _ := json.Marshal(gen.Story.AcceptanceCriteria)
-
-			story, err := d.CreateStory(
-				p.ID,
-				gen.Story.Title,
-				gen.Story.Description,
-				string(acJSON),
-			)
+			story, err := persistGeneratedStory(app.DB, app.Project.ID, gen)
 			if err != nil {
-				return fmt.Errorf("saving story: %w", err)
-			}
-
-			for _, t := range gen.Tasks {
-				task, err := d.CreateTask(story.ID, t.Title)
-				if err != nil {
-					return fmt.Errorf("saving task: %w", err)
-				}
-				for _, st := range t.Subtasks {
-					if _, err := d.CreateSubtask(task.ID, st); err != nil {
-						return fmt.Errorf("saving subtask: %w", err)
-					}
-				}
+				return err
 			}
 
 			ui.Success(fmt.Sprintf("Created %s: %s", story.Slug, story.Title))
 
-			tasks, _ := d.ListTasksForStory(story.ID)
-			subtaskMap := map[int64][]*db.Subtask{}
-			for _, t := range tasks {
-				subtaskMap[t.ID], _ = d.ListSubtasksForTask(t.ID)
+			view, err := app.DB.LoadStoryView(story.ID)
+			if err != nil {
+				return err
 			}
-			ui.PrintStory(story, tasks, subtaskMap)
+			ui.PrintStory(view)
 			return nil
 		},
 	}
@@ -186,7 +148,6 @@ func storyCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Print the prompt without calling the LLM")
 	cmd.Flags().StringVar(&agent, "agent", "", "LLM provider override: deepseek | openai | pi | opencode")
 	cmd.Flags().StringVar(&model, "model", "", "Model override (e.g. github-copilot/claude-haiku-4.5)")
-
 	return cmd
 }
 
@@ -199,42 +160,34 @@ func listCmd() *cobra.Command {
 		Use:   "list",
 		Short: "List all stories and tasks for the current project",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			d := mustOpenDB()
-			defer d.Close()
-
-			var p *db.Project
-			var root string
+			app, err := openAppContext()
+			if err != nil {
+				return err
+			}
+			defer app.Close()
 
 			if projectName != "" {
-				var err error
-				p, err = d.GetProject(projectName)
+				p, err := app.DB.GetProject(projectName)
 				if err != nil {
 					return fmt.Errorf("project %q not found", projectName)
 				}
-				root = p.Path
-			} else {
-				p, root = mustProject(d)
+				app.Project = p
+				app.Root = p.Path
 			}
 
-			stories, err := d.ListStories(p.ID)
+			views, err := app.DB.LoadProjectView(app.Project.ID)
 			if err != nil {
 				return err
 			}
 
-			ui.PrintProject(p.Name, root)
+			ui.PrintProject(app.Project.Name, app.Root)
 
-			if len(stories) == 0 {
+			if len(views) == 0 {
 				ui.Info("No stories yet. Run: task story \"<feature>\"")
 				return nil
 			}
-
-			for _, s := range stories {
-				tasks, _ := d.ListTasksForStory(s.ID)
-				subtaskMap := map[int64][]*db.Subtask{}
-				for _, t := range tasks {
-					subtaskMap[t.ID], _ = d.ListSubtasksForTask(t.ID)
-				}
-				ui.PrintStory(s, tasks, subtaskMap)
+			for _, v := range views {
+				ui.PrintStory(v)
 			}
 			fmt.Println()
 			return nil
@@ -250,41 +203,28 @@ func listCmd() *cobra.Command {
 func showCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "show <S-N>",
-		Short: "Show a story with full detail",
+		Short: "Show a story with full detail including acceptance criteria",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			slug := args[0]
-
-			d := mustOpenDB()
-			defer d.Close()
-
-			p, _ := mustProject(d)
-
-			s, err := d.GetStoryBySlug(p.ID, slug)
+			app, err := openAppContext()
 			if err != nil {
-				return fmt.Errorf("story %q not found in project %q", slug, p.Name)
+				return err
+			}
+			defer app.Close()
+
+			s, err := app.DB.GetStoryBySlug(app.Project.ID, args[0])
+			if err != nil {
+				return fmt.Errorf("story %q not found in project %q", args[0], app.Project.Name)
 			}
 
-			tasks, _ := d.ListTasksForStory(s.ID)
-			subtaskMap := map[int64][]*db.Subtask{}
-			for _, t := range tasks {
-				subtaskMap[t.ID], _ = d.ListSubtasksForTask(t.ID)
+			view, err := app.DB.LoadStoryView(s.ID)
+			if err != nil {
+				return err
 			}
 
 			fmt.Println()
-			ui.PrintStory(s, tasks, subtaskMap)
-
-			// Print acceptance criteria
-			if s.AcceptanceCriteria != "" {
-				fmt.Println()
-				fmt.Println("  Acceptance criteria:")
-				var criteria []string
-				if err := json.Unmarshal([]byte(s.AcceptanceCriteria), &criteria); err == nil {
-					for _, c := range criteria {
-						fmt.Printf("    · %s\n", c)
-					}
-				}
-			}
+			ui.PrintStory(view)
+			ui.PrintAcceptanceCriteria(s.AcceptanceCriteria)
 			fmt.Println()
 			return nil
 		},
@@ -298,23 +238,25 @@ func statusCmd() *cobra.Command {
 		Use:   "status",
 		Short: "Show project progress summary",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			d := mustOpenDB()
-			defer d.Close()
+			app, err := openAppContext()
+			if err != nil {
+				return err
+			}
+			defer app.Close()
 
-			p, root := mustProject(d)
-			stats, err := d.GetProjectStats(p.ID)
+			stats, err := app.DB.GetProjectStats(app.Project.ID)
 			if err != nil {
 				return err
 			}
 
-			ui.PrintProject(p.Name, root)
+			ui.PrintProject(app.Project.Name, app.Root)
 			ui.PrintStats(stats)
 			return nil
 		},
 	}
 }
 
-// ── done ──────────────────────────────────────────────────────────────────────
+// ── done / start ──────────────────────────────────────────────────────────────
 
 func doneCmd() *cobra.Command {
 	return &cobra.Command{
@@ -325,8 +267,6 @@ func doneCmd() *cobra.Command {
 	}
 }
 
-// ── start ─────────────────────────────────────────────────────────────────────
-
 func startCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "start <T-N>",
@@ -336,26 +276,29 @@ func startCmd() *cobra.Command {
 	}
 }
 
-func setStatusCmd(status string) func(cmd *cobra.Command, args []string) error {
+func setStatusCmd(status string) func(*cobra.Command, []string) error {
 	return func(cmd *cobra.Command, args []string) error {
 		slug := args[0]
+		if len(slug) < 2 {
+			return fmt.Errorf("invalid slug %q — expected S-N or T-N", slug)
+		}
 
-		d := mustOpenDB()
-		defer d.Close()
-
-		p, _ := mustProject(d)
+		app, err := openAppContext()
+		if err != nil {
+			return err
+		}
+		defer app.Close()
 
 		switch slug[0] {
 		case 'S':
-			if err := d.SetStoryStatus(p.ID, slug, status); err != nil {
-				return err
-			}
+			err = app.DB.SetStoryStatus(app.Project.ID, slug, status)
 		case 'T':
-			if err := d.SetTaskStatus(p.ID, slug, status); err != nil {
-				return err
-			}
+			err = app.DB.SetTaskStatus(app.Project.ID, slug, status)
 		default:
 			return fmt.Errorf("unrecognised slug %q — use S-N for stories, T-N for tasks", slug)
+		}
+		if err != nil {
+			return err
 		}
 
 		ui.Success(fmt.Sprintf("%s marked as %s", slug, status))
@@ -370,7 +313,6 @@ func addCmd() *cobra.Command {
 		Use:   "add",
 		Short: "Manually add a task or subtask",
 	}
-
 	cmd.AddCommand(addTaskCmd(), addSubtaskCmd())
 	return cmd
 }
@@ -383,22 +325,18 @@ func addTaskCmd() *cobra.Command {
 		Short: "Add a task to a story",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if storySlug == "" {
-				return fmt.Errorf("--story required (e.g. --story S-1)")
+			app, err := openAppContext()
+			if err != nil {
+				return err
 			}
-			title := args[0]
+			defer app.Close()
 
-			d := mustOpenDB()
-			defer d.Close()
-
-			p, _ := mustProject(d)
-
-			s, err := d.GetStoryBySlug(p.ID, storySlug)
+			s, err := app.DB.GetStoryBySlug(app.Project.ID, storySlug)
 			if err != nil {
 				return fmt.Errorf("story %q not found", storySlug)
 			}
 
-			t, err := d.CreateTask(s.ID, title)
+			t, err := app.DB.CreateTask(s.ID, args[0])
 			if err != nil {
 				return err
 			}
@@ -408,7 +346,7 @@ func addTaskCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&storySlug, "story", "", "Story slug (e.g. S-1) to add the task to")
+	cmd.Flags().StringVar(&storySlug, "story", "", "Story slug (e.g. S-1)")
 	_ = cmd.MarkFlagRequired("story")
 	return cmd
 }
@@ -421,22 +359,18 @@ func addSubtaskCmd() *cobra.Command {
 		Short: "Add a subtask to a task",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if taskSlug == "" {
-				return fmt.Errorf("--task required (e.g. --task T-1)")
+			app, err := openAppContext()
+			if err != nil {
+				return err
 			}
-			title := args[0]
+			defer app.Close()
 
-			d := mustOpenDB()
-			defer d.Close()
-
-			p, _ := mustProject(d)
-
-			t, err := d.GetTaskBySlug(p.ID, taskSlug)
+			t, err := app.DB.GetTaskBySlug(app.Project.ID, taskSlug)
 			if err != nil {
 				return fmt.Errorf("task %q not found", taskSlug)
 			}
 
-			st, err := d.CreateSubtask(t.ID, title)
+			st, err := app.DB.CreateSubtask(t.ID, args[0])
 			if err != nil {
 				return err
 			}
@@ -446,8 +380,117 @@ func addSubtaskCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&taskSlug, "task", "", "Task slug (e.g. T-1) to add the subtask to")
+	cmd.Flags().StringVar(&taskSlug, "task", "", "Task slug (e.g. T-1)")
 	_ = cmd.MarkFlagRequired("task")
+	return cmd
+}
+
+// ── rm ────────────────────────────────────────────────────────────────────────
+
+func rmCmd() *cobra.Command {
+	var yes bool
+
+	cmd := &cobra.Command{
+		Use:   "rm <S-N | T-N>",
+		Short: "Remove a story or task (and all its children)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			slug := args[0]
+			if len(slug) < 2 {
+				return fmt.Errorf("invalid slug %q", slug)
+			}
+
+			if !yes {
+				fmt.Printf("Remove %s and all its children? [y/N] ", slug)
+				var confirm string
+				fmt.Scanln(&confirm)
+				if confirm != "y" && confirm != "Y" {
+					ui.Info("Aborted.")
+					return nil
+				}
+			}
+
+			app, err := openAppContext()
+			if err != nil {
+				return err
+			}
+			defer app.Close()
+
+			switch slug[0] {
+			case 'S':
+				err = app.DB.DeleteStory(app.Project.ID, slug)
+			case 'T':
+				err = app.DB.DeleteTask(app.Project.ID, slug)
+			default:
+				return fmt.Errorf("unrecognised slug %q — use S-N or T-N", slug)
+			}
+			if err != nil {
+				return err
+			}
+
+			ui.Success(fmt.Sprintf("Removed %s", slug))
+			return nil
+		},
+	}
+
+	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "Skip confirmation prompt")
+	return cmd
+}
+
+// ── export ────────────────────────────────────────────────────────────────────
+
+func exportCmd() *cobra.Command {
+	var format string
+	var outFile string
+
+	cmd := &cobra.Command{
+		Use:   "export",
+		Short: "Export stories to markdown or JSON",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			app, err := openAppContext()
+			if err != nil {
+				return err
+			}
+			defer app.Close()
+
+			views, err := app.DB.LoadProjectView(app.Project.ID)
+			if err != nil {
+				return err
+			}
+			if len(views) == 0 {
+				ui.Info("Nothing to export.")
+				return nil
+			}
+
+			w := os.Stdout
+			if outFile != "" {
+				f, err := os.Create(outFile)
+				if err != nil {
+					return fmt.Errorf("creating output file: %w", err)
+				}
+				defer f.Close()
+				w = f
+			}
+
+			switch format {
+			case "json":
+				err = export.ToJSON(w, app.Project, views)
+			default:
+				err = export.ToMarkdown(w, app.Project, views)
+			}
+			if err != nil {
+				return err
+			}
+
+			if outFile != "" {
+				ui.Success(fmt.Sprintf("Exported to %s", outFile))
+			}
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVarP(&format, "format", "f", "markdown", "Output format: markdown | json")
+	cmd.Flags().StringVarP(&outFile, "out", "o", "", "Output file (defaults to stdout)")
 	return cmd
 }
 
@@ -469,21 +512,19 @@ func configInitCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			path, _ := config.Path()
 
-			// Don't overwrite existing config
 			if _, err := os.Stat(path); err == nil {
 				ui.Warn(fmt.Sprintf("Config already exists at %s", path))
-				ui.Info("Edit it directly or delete it to regenerate.")
+				ui.Info("Edit it directly, or delete it and re-run to regenerate.")
 				return nil
 			}
 
-			cfg := config.Default()
-			if err := config.Save(cfg); err != nil {
+			if err := config.Save(config.Default()); err != nil {
 				return err
 			}
 
 			ui.Success(fmt.Sprintf("Config created at %s", path))
 			ui.Info("Set your API key: edit the file or set TASK_API_KEY=sk-...")
-			ui.Info("Default provider: deepseek (change to pi or opencode for free usage via Copilot)")
+			ui.Info("For free usage: set provider = \"pi\" and use --model github-copilot/claude-haiku-4.5")
 			return nil
 		},
 	}
@@ -503,10 +544,13 @@ func configShowCmd() *cobra.Command {
 				return err
 			}
 
-			// Redact key
 			display := *cfg
 			if display.LLM.APIKey != "" {
-				display.LLM.APIKey = display.LLM.APIKey[:min(8, len(display.LLM.APIKey))] + "…"
+				n := len(display.LLM.APIKey)
+				if n > 8 {
+					n = 8
+				}
+				display.LLM.APIKey = display.LLM.APIKey[:n] + "…"
 			}
 
 			path, _ := config.Path()
@@ -521,19 +565,46 @@ func configShowCmd() *cobra.Command {
 	}
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+// ── internal helpers ──────────────────────────────────────────────────────────
 
-func loadOrDefault() (*config.Config, error) {
-	cfg, err := config.Load()
-	if err == config.ErrNotFound {
-		return config.Default(), nil
+// persistGeneratedStory writes a GeneratedStory to the database and returns
+// the created Story record.
+func persistGeneratedStory(d *db.DB, projectID int64, gen *llm.GeneratedStory) (*db.Story, error) {
+	acJSON, _ := json.Marshal(gen.Story.AcceptanceCriteria)
+
+	story, err := d.CreateStory(projectID, gen.Story.Title, gen.Story.Description, string(acJSON))
+	if err != nil {
+		return nil, fmt.Errorf("saving story: %w", err)
 	}
-	return cfg, err
+
+	for _, t := range gen.Tasks {
+		task, err := d.CreateTask(story.ID, t.Title)
+		if err != nil {
+			return nil, fmt.Errorf("saving task: %w", err)
+		}
+		for _, st := range t.Subtasks {
+			if _, err := d.CreateSubtask(task.ID, st); err != nil {
+				return nil, fmt.Errorf("saving subtask: %w", err)
+			}
+		}
+	}
+
+	return story, nil
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
+// printOnboarding prints a first-run guide when no config and no API key exist.
+func printOnboarding() {
+	ui.Warn("No config found and TASK_API_KEY is not set.")
+	fmt.Println()
+	fmt.Println("  Quick setup options:")
+	fmt.Println()
+	fmt.Println("  1. Free via GitHub Copilot (recommended):")
+	fmt.Println("       task config init")
+	fmt.Println("       # then edit ~/.task/config.toml: set provider = \"pi\"")
+	fmt.Println("       task story \"your feature\" --agent pi --model github-copilot/claude-haiku-4.5")
+	fmt.Println()
+	fmt.Println("  2. DeepSeek direct (~$0.00011 per call):")
+	fmt.Println("       task config init")
+	fmt.Println("       export TASK_API_KEY=sk-...")
+	fmt.Println()
 }

@@ -180,6 +180,14 @@ func (db *DB) SetStoryStatus(projectID int64, slug, status string) error {
 	return err
 }
 
+func (db *DB) DeleteStory(projectID int64, slug string) error {
+	_, err := db.Exec(
+		`DELETE FROM stories WHERE project_id = ? AND slug = ?`,
+		projectID, slug,
+	)
+	return err
+}
+
 func scanStory(s interface{ Scan(...any) error }) (*Story, error) {
 	st := &Story{}
 	return st, s.Scan(
@@ -284,6 +292,16 @@ func (db *DB) SetTaskStatus(projectID int64, slug, status string) error {
 	return err
 }
 
+func (db *DB) DeleteTask(projectID int64, slug string) error {
+	_, err := db.Exec(
+		`DELETE FROM tasks WHERE slug = ? AND story_id IN (
+             SELECT id FROM stories WHERE project_id = ?
+         )`,
+		slug, projectID,
+	)
+	return err
+}
+
 func scanTask(s interface{ Scan(...any) error }) (*Task, error) {
 	t := &Task{}
 	return t, s.Scan(&t.ID, &t.StoryID, &t.Slug, &t.Title, &t.Status, &t.CreatedAt, &t.UpdatedAt)
@@ -354,6 +372,56 @@ func (db *DB) SetSubtaskStatus(taskID int64, slug, status string) error {
 		status, taskID, slug,
 	)
 	return err
+}
+
+// ── Story Views ─────────────────────────────────────────────────────────────────
+
+// StoryView bundles a story with its tasks and subtasks for display and export.
+type StoryView struct {
+	Story    *Story
+	Tasks    []*Task
+	Subtasks map[int64][]*Subtask // keyed by task ID
+}
+
+// LoadStoryView loads a story and all its tasks and subtasks in one call.
+func (db *DB) LoadStoryView(storyID int64) (*StoryView, error) {
+	s, err := db.GetStoryByID(storyID)
+	if err != nil {
+		return nil, err
+	}
+
+	tasks, err := db.ListTasksForStory(storyID)
+	if err != nil {
+		return nil, err
+	}
+
+	subtasks := make(map[int64][]*Subtask, len(tasks))
+	for _, t := range tasks {
+		subtasks[t.ID], err = db.ListSubtasksForTask(t.ID)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &StoryView{Story: s, Tasks: tasks, Subtasks: subtasks}, nil
+}
+
+// LoadProjectView loads all stories for a project, each with tasks and subtasks.
+func (db *DB) LoadProjectView(projectID int64) ([]*StoryView, error) {
+	stories, err := db.ListStories(projectID)
+	if err != nil {
+		return nil, err
+	}
+
+	views := make([]*StoryView, 0, len(stories))
+	for _, s := range stories {
+		v, err := db.LoadStoryView(s.ID)
+		if err != nil {
+			return nil, err
+		}
+		views = append(views, v)
+	}
+	return views, nil
 }
 
 // ── Stats ─────────────────────────────────────────────────────────────────────

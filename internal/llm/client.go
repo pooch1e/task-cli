@@ -11,9 +11,9 @@ type StoryRequest struct {
 // GeneratedStory is the structured output from the LLM.
 type GeneratedStory struct {
 	Story struct {
-		Title               string   `json:"title"`
-		Description         string   `json:"description"`
-		AcceptanceCriteria  []string `json:"acceptance_criteria"`
+		Title              string   `json:"title"`
+		Description        string   `json:"description"`
+		AcceptanceCriteria []string `json:"acceptance_criteria"`
 	} `json:"story"`
 	Tasks []struct {
 		Title    string   `json:"title"`
@@ -23,19 +23,18 @@ type GeneratedStory struct {
 
 // Client is the interface every provider must implement.
 type Client interface {
-	// GenerateStory calls the LLM and returns a parsed story with tasks.
 	GenerateStory(req StoryRequest) (*GeneratedStory, error)
 }
 
-// New returns the right Client based on config.
+// New returns the right Client based on the provider in cfg.
 func New(cfg *config.Config) Client {
 	switch cfg.LLM.Provider {
 	case "pi":
-		return &PiClient{cfg: cfg}
+		return PiClient(cfg)
 	case "opencode":
-		return &OpencodeClient{cfg: cfg}
+		return OpencodeClient(cfg)
 	default:
 		// deepseek, openai, or any OpenAI-compatible endpoint
-		return &OpenAIClient{cfg: cfg}
+		return newOpenAIClient(cfg)
 	}
 }

@@ -2,69 +2,76 @@ package llm
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os/exec"
-	"strings"
+	"time"
 
 	"github.com/joelkram/task-cli/internal/config"
 )
 
-// PiClient spawns `pi --mode json -p "<prompt>"` and parses the last assistant text.
-type PiClient struct {
-	cfg *config.Config
+// subprocessClient runs an external agent binary (pi or opencode) and parses
+// its JSON event stream output. Both tools emit the same event format.
+type subprocessClient struct {
+	cfg     *config.Config
+	binary  string
+	argsFn  func(prompt, model string) []string
 }
 
-func (c *PiClient) GenerateStory(req StoryRequest) (*GeneratedStory, error) {
-	prompt := systemPrompt + "\n\n" + buildPrompt(req)
-
-	args := []string{"--mode", "json", "--no-session", "-p", prompt}
-	if c.cfg.LLM.Model != "" {
-		args = append(args, "--model", c.cfg.LLM.Model)
-	}
-
-	out, err := exec.Command("pi", args...).Output()
-	if err != nil {
-		return nil, fmt.Errorf("pi subprocess failed: %w", err)
-	}
-
-	text, err := extractLastAssistantText(out)
-	if err != nil {
-		return nil, err
-	}
-
-	return parseStoryJSON(text)
+func (c *subprocessClient) GenerateStory(req StoryRequest) (*GeneratedStory, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(c.cfg.LLM.TimeoutSecs)*time.Second)
+	defer cancel()
+	return generateWithRetry(ctx, c, req)
 }
 
-// OpencodeClient spawns `opencode run "<prompt>" --format json` and parses output.
-type OpencodeClient struct {
-	cfg *config.Config
+// call implements the caller interface: spawns the binary, waits for it to
+// finish, and extracts the last assistant text from the event stream.
+func (c *subprocessClient) call(ctx context.Context, prompt string) (string, error) {
+	args := c.argsFn(prompt, c.cfg.LLM.Model)
+	out, err := exec.CommandContext(ctx, c.binary, args...).Output()
+	if err != nil {
+		return "", fmt.Errorf("%s subprocess failed: %w", c.binary, err)
+	}
+	return extractLastAssistantText(out)
 }
 
-func (c *OpencodeClient) GenerateStory(req StoryRequest) (*GeneratedStory, error) {
-	prompt := systemPrompt + "\n\n" + buildPrompt(req)
+// ── factory constructors ──────────────────────────────────────────────────────
 
-	args := []string{"run", "--format", "json"}
-	if c.cfg.LLM.Model != "" {
-		args = append(args, "--model", c.cfg.LLM.Model)
+// PiClient returns a subprocessClient configured for pi's JSON event stream.
+func PiClient(cfg *config.Config) Client {
+	return &subprocessClient{
+		cfg:    cfg,
+		binary: "pi",
+		argsFn: func(prompt, model string) []string {
+			args := []string{"--mode", "json", "--no-session", "-p", prompt}
+			if model != "" {
+				args = append(args, "--model", model)
+			}
+			return args
+		},
 	}
-	args = append(args, prompt)
-
-	out, err := exec.Command("opencode", args...).Output()
-	if err != nil {
-		return nil, fmt.Errorf("opencode subprocess failed: %w", err)
-	}
-
-	text, err := extractLastAssistantText(out)
-	if err != nil {
-		return nil, err
-	}
-
-	return parseStoryJSON(text)
 }
 
-// extractLastAssistantText parses a JSON event stream (one object per line)
-// and returns the final assembled assistant text.
+// OpencodeClient returns a subprocessClient configured for opencode's JSON output.
+func OpencodeClient(cfg *config.Config) Client {
+	return &subprocessClient{
+		cfg:    cfg,
+		binary: "opencode",
+		argsFn: func(prompt, model string) []string {
+			args := []string{"run", "--format", "json"}
+			if model != "" {
+				args = append(args, "--model", model)
+			}
+			return append(args, prompt)
+		},
+	}
+}
+
+// ── event stream parsing ──────────────────────────────────────────────────────
+
+// extractLastAssistantText parses a newline-delimited JSON event stream and
+// returns the last fully-assembled assistant message text.
 func extractLastAssistantText(output []byte) (string, error) {
 	var lastText string
 	var buf bytes.Buffer
@@ -77,27 +84,22 @@ func extractLastAssistantText(output []byte) (string, error) {
 
 		var event map[string]json.RawMessage
 		if err := json.Unmarshal(line, &event); err != nil {
-			continue // skip non-JSON lines (e.g. spinner output)
+			continue // skip non-JSON lines (e.g. spinner/progress output)
 		}
 
-		eventType := strings.Trim(string(event["type"]), `"`)
-
-		switch eventType {
+		switch jsonString(event["type"]) {
 		case "message_start":
 			buf.Reset()
 
 		case "message_update":
-			// Extract delta text from assistantMessageEvent
-			if raw, ok := event["assistantMessageEvent"]; ok {
-				var ame map[string]json.RawMessage
-				if err := json.Unmarshal(raw, &ame); err == nil {
-					if t := strings.Trim(string(ame["type"]), `"`); t == "text_delta" {
-						// ame["delta"] is a JSON string — unmarshal it directly
-						var delta string
-						if err := json.Unmarshal(ame["delta"], &delta); err == nil {
-							buf.WriteString(delta)
-						}
-					}
+			var ame map[string]json.RawMessage
+			if err := json.Unmarshal(event["assistantMessageEvent"], &ame); err != nil {
+				break
+			}
+			if jsonString(ame["type"]) == "text_delta" {
+				var delta string
+				if err := json.Unmarshal(ame["delta"], &delta); err == nil {
+					buf.WriteString(delta)
 				}
 			}
 
@@ -108,11 +110,8 @@ func extractLastAssistantText(output []byte) (string, error) {
 			}
 
 		case "agent_end":
-			// Also try to extract from messages array if incremental deltas were empty
 			if lastText == "" {
-				if raw, ok := event["messages"]; ok {
-					lastText = extractFromMessages(raw)
-				}
+				lastText = lastAssistantTextFromMessages(event["messages"])
 			}
 		}
 	}
@@ -123,29 +122,39 @@ func extractLastAssistantText(output []byte) (string, error) {
 	return lastText, nil
 }
 
-func extractFromMessages(raw json.RawMessage) string {
+// lastAssistantTextFromMessages walks a messages JSON array in reverse and
+// returns the text content of the last assistant message.
+func lastAssistantTextFromMessages(raw json.RawMessage) string {
 	var messages []map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &messages); err != nil {
 		return ""
 	}
 	for i := len(messages) - 1; i >= 0; i-- {
-		msg := messages[i]
-		role := strings.Trim(string(msg["role"]), `"`)
-		if role != "assistant" {
+		if jsonString(messages[i]["role"]) != "assistant" {
 			continue
 		}
-		var content []map[string]json.RawMessage
-		if err := json.Unmarshal(msg["content"], &content); err != nil {
+		var blocks []map[string]json.RawMessage
+		if err := json.Unmarshal(messages[i]["content"], &blocks); err != nil {
 			continue
 		}
-		for _, block := range content {
-			if strings.Trim(string(block["type"]), `"`) == "text" {
+		for _, b := range blocks {
+			if jsonString(b["type"]) == "text" {
 				var text string
-				if err := json.Unmarshal(block["text"], &text); err == nil && text != "" {
+				if err := json.Unmarshal(b["text"], &text); err == nil && text != "" {
 					return text
 				}
 			}
 		}
 	}
 	return ""
+}
+
+// jsonString safely decodes a json.RawMessage that is expected to be a JSON
+// string, returning an empty string on any error.
+func jsonString(raw json.RawMessage) string {
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return ""
+	}
+	return s
 }

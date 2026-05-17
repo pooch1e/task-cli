@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"github.com/BurntSushi/toml"
 )
@@ -89,7 +90,7 @@ func Save(cfg *Config) error {
 	}
 
 	path := filepath.Join(dir, "config.toml")
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0600)
 	if err != nil {
 		return err
 	}
@@ -141,6 +142,16 @@ func (c *Config) applyDefaults() {
 	}
 }
 
+// LoadOrDefault loads config, returning Default() if the file does not exist.
+func LoadOrDefault() (*Config, error) {
+	cfg, err := Load()
+	if err == ErrNotFound {
+		return Default(), nil
+	}
+	return cfg, err
+}
+
+// Validate returns an error if required fields are missing.
 func (c *Config) Validate() error {
 	if c.LLM.Provider != "pi" && c.LLM.Provider != "opencode" && c.LLM.APIKey == "" {
 		if os.Getenv("TASK_API_KEY") == "" {
