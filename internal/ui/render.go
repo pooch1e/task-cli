@@ -137,3 +137,6 @@ func Success(msg string) { fmt.Printf("%s %s\n", color(ansiGreen, "✓"), msg) }
 func Error(msg string)   { fmt.Printf("%s %s\n", color(ansiRed, "✗"), msg) }
 func Info(msg string)    { fmt.Printf("%s %s\n", color(ansiCyan, "ℹ"), msg) }
 func Warn(msg string)    { fmt.Printf("%s %s\n", color(ansiYellow, "⚠"), msg) }
+
+// Dimmed returns s styled as dim/grey text (or plain text on non-TTY).
+func Dimmed(s string) string { return dimS(s) }

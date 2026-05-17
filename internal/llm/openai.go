@@ -35,6 +35,17 @@ func (c *OpenAIClient) GenerateStory(req StoryRequest) (*GeneratedStory, error) 
 	return generateWithRetry(ctx, c, req)
 }
 
+// Ping sends a minimal single-token request to verify credentials and connectivity.
+func (c *OpenAIClient) Ping() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := c.call(ctx, PromptParts{
+		System: "Respond with valid JSON only.",
+		User:   `Respond with exactly: {"ok":true}`,
+	})
+	return err
+}
+
 // call implements the caller interface: builds the OpenAI messages payload,
 // POSTs to the configured endpoint, and returns the assistant text.
 func (c *OpenAIClient) call(ctx context.Context, parts PromptParts) (string, error) {

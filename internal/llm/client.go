@@ -26,7 +26,11 @@ type GeneratedStory struct {
 
 // Client is the interface every provider must implement.
 type Client interface {
+	// GenerateStory calls the LLM and returns a parsed story with tasks.
 	GenerateStory(req StoryRequest) (*GeneratedStory, error)
+	// Ping performs a lightweight health check: verifies credentials and
+	// connectivity without generating a full story.
+	Ping() error
 }
 
 // New returns the right Client based on the provider in cfg.
@@ -36,6 +40,8 @@ func New(cfg *config.Config) Client {
 		return PiClient(cfg)
 	case config.ProviderOpencode:
 		return OpencodeClient(cfg)
+	case config.ProviderGemini:
+		return newGeminiClient(cfg)
 	default:
 		return newOpenAIClient(cfg)
 	}

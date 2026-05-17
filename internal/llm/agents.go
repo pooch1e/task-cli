@@ -25,6 +25,15 @@ func (c *subprocessClient) GenerateStory(req StoryRequest) (*GeneratedStory, err
 	return generateWithRetry(ctx, c, req)
 }
 
+// Ping checks that the agent binary exists in PATH.
+func (c *subprocessClient) Ping() error {
+	_, err := exec.LookPath(c.binary)
+	if err != nil {
+		return fmt.Errorf("%s not found in PATH: %w", c.binary, err)
+	}
+	return nil
+}
+
 // call implements the caller interface: spawns the binary with a combined
 // system+user prompt and extracts the last assistant text from the event stream.
 func (c *subprocessClient) call(ctx context.Context, parts PromptParts) (string, error) {

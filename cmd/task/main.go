@@ -9,6 +9,7 @@ import (
 	"github.com/joelkram/task-cli/internal/db"
 	"github.com/joelkram/task-cli/internal/export"
 	"github.com/joelkram/task-cli/internal/llm"
+	"github.com/joelkram/task-cli/internal/ratelimit"
 	"github.com/joelkram/task-cli/internal/ui"
 	"github.com/spf13/cobra"
 )
@@ -38,6 +39,7 @@ func rootCmd() *cobra.Command {
 		addCmd(),
 		rmCmd(),
 		exportCmd(),
+		providersCmd(),
 		configCmd(),
 	)
 	return cmd
@@ -113,6 +115,13 @@ func storyCmd() *cobra.Command {
 			defer app.Close()
 
 			ui.Info(fmt.Sprintf("Generating story for %q using %s/%s …", feature, cfg.LLM.Provider, cfg.LLM.Model))
+
+			// Rate-limit guard: warn if the LLM is being called too frequently.
+			if dir, err := config.Dir(); err == nil {
+				if exceeded, rlErr := ratelimit.CheckAndRecord(dir); rlErr == nil && exceeded {
+					ui.Warn("Rate limit: more than 5 LLM calls in the last 60s — check your usage.")
+				}
+			}
 
 			gen, err := llm.New(cfg).GenerateStory(llm.StoryRequest{
 				Feature:     feature,
@@ -484,11 +493,56 @@ func exportCmd() *cobra.Command {
 	return cmd
 }
 
+// ── providers ────────────────────────────────────────────────────────────────
+
+func providersCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "providers",
+		Short: "List all supported LLM providers with cost and key information",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, _ := config.LoadOrDefault()
+			current := cfg.LLM.Provider
+
+			fmt.Printf("\n  %-12s  %-32s  %-14s  %-20s  %s\n",
+				"Provider", "Default model", "Cost/1K in", "Key required", "Notes")
+			fmt.Printf("  %s\n", ui.Dimmed(repeat("-", 100)))
+
+			for _, p := range config.KnownProviders {
+				marker := "  "
+				if p.Name == current {
+					marker = "\u25b6 "
+				}
+				var cost string
+				if p.CostPer1KInput == 0 {
+					cost = "free"
+				} else {
+					cost = fmt.Sprintf("$%.5f", p.CostPer1KInput)
+				}
+				keyInfo := "none"
+				if p.KeyRequired {
+					if p.KeyEnvVar != "" && p.KeyEnvVar != "TASK_API_KEY" {
+						keyInfo = p.KeyEnvVar + " or TASK_API_KEY"
+					} else {
+						keyInfo = "TASK_API_KEY"
+					}
+				}
+				fmt.Printf("%s%-12s  %-32s  %-14s  %-20s  %s\n",
+					marker, p.Name,
+					truncate(p.DefaultModel, 32),
+					cost, keyInfo, p.Notes,
+				)
+			}
+			fmt.Printf("\n  \u25b6 = current provider (%s)\n\n", current)
+			return nil
+		},
+	}
+}
+
 // ── config ────────────────────────────────────────────────────────────────────
 
 func configCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "config", Short: "Manage task configuration"}
-	cmd.AddCommand(configInitCmd(), configShowCmd())
+	cmd.AddCommand(configInitCmd(), configShowCmd(), configTestCmd())
 	return cmd
 }
 
@@ -543,6 +597,34 @@ func configShowCmd() *cobra.Command {
 	}
 }
 
+func configTestCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "test",
+		Short: "Fire a test prompt to verify the current config is working",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err == config.ErrNotFound {
+				ui.Warn("No config file. Run: task config init")
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if err := cfg.Validate(); err != nil {
+				ui.Error(err.Error())
+				return nil
+			}
+			ui.Info(fmt.Sprintf("Testing %s / %s …", cfg.LLM.Provider, cfg.LLM.Model))
+			if err := llm.New(cfg).Ping(); err != nil {
+				ui.Error(fmt.Sprintf("Connection failed: %s", err))
+				return nil
+			}
+			ui.Success("Connection OK")
+			return nil
+		},
+	}
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 // saveGeneratedStory converts a GeneratedStory to DB inputs and persists it
@@ -573,4 +655,21 @@ func printOnboarding() {
 	fmt.Println("  DeepSeek direct (~$0.00011/call):")
 	fmt.Println("    task config init && export TASK_API_KEY=sk-...")
 	fmt.Println()
+}
+
+// truncate shortens s to maxLen, appending … if truncated.
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-1] + "…"
+}
+
+// repeat returns a string of n copies of char.
+func repeat(char string, n int) string {
+	out := make([]byte, 0, len(char)*n)
+	for i := 0; i < n; i++ {
+		out = append(out, char...)
+	}
+	return string(out)
 }

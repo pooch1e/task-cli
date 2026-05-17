@@ -15,6 +15,7 @@ import (
 const (
 	ProviderPi       = "pi"
 	ProviderOpencode = "opencode"
+	ProviderGemini   = "gemini"
 )
 
 type LLMConfig struct {
@@ -133,27 +134,38 @@ func Default() *Config {
 	}
 }
 
-// applyDefaults fills zero-value fields with defaults. Each field is checked
-// individually — add a corresponding check here whenever adding a new field.
+// applyDefaults fills zero-value fields using KnownProviders metadata where
+// available, falling back to hardcoded deepseek defaults for unknown providers.
 func (c *Config) applyDefaults() {
-	d := Default()
-	if c.LLM.Provider == "" {
-		c.LLM.Provider = d.LLM.Provider
-	}
-	if c.LLM.Model == "" {
-		c.LLM.Model = d.LLM.Model
-	}
-	if c.LLM.BaseURL == "" {
-		c.LLM.BaseURL = d.LLM.BaseURL
+	if meta := LookupProvider(c.LLM.Provider); meta != nil {
+		if c.LLM.Model == "" {
+			c.LLM.Model = meta.DefaultModel
+		}
+		if c.LLM.BaseURL == "" {
+			c.LLM.BaseURL = meta.DefaultBaseURL
+		}
+	} else {
+		// Unknown provider — use deepseek as a safe fallback.
+		d := Default()
+		if c.LLM.Provider == "" {
+			c.LLM.Provider = d.LLM.Provider
+		}
+		if c.LLM.Model == "" {
+			c.LLM.Model = d.LLM.Model
+		}
+		if c.LLM.BaseURL == "" {
+			c.LLM.BaseURL = d.LLM.BaseURL
+		}
 	}
 	if c.LLM.MaxTokens == 0 {
-		c.LLM.MaxTokens = d.LLM.MaxTokens
+		c.LLM.MaxTokens = 1024
 	}
 	if c.LLM.TimeoutSecs == 0 {
-		c.LLM.TimeoutSecs = d.LLM.TimeoutSecs
+		c.LLM.TimeoutSecs = 30
 	}
 	if c.Storage.DBPath == "" {
-		c.Storage.DBPath = d.Storage.DBPath
+		dir, _ := Dir()
+		c.Storage.DBPath = filepath.Join(dir, "tasks.db")
 	}
 }
 
@@ -167,6 +179,14 @@ func (c *Config) applyDefaults() {
 func (c *Config) applyEnvOverrides() {
 	if v := os.Getenv("TASK_API_KEY"); v != "" {
 		c.LLM.APIKey = v
+	}
+	// Provider-specific key env vars (checked only if TASK_API_KEY not set).
+	if c.LLM.APIKey == "" {
+		if meta := LookupProvider(c.LLM.Provider); meta != nil && meta.KeyEnvVar != "" {
+			if v := os.Getenv(meta.KeyEnvVar); v != "" {
+				c.LLM.APIKey = v
+			}
+		}
 	}
 	if v := os.Getenv("TASK_PROVIDER"); v != "" {
 		c.LLM.Provider = v
