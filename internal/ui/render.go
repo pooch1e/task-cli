@@ -3,51 +3,69 @@ package ui
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/joelkram/task-cli/internal/db"
 )
 
-// ANSI colour helpers — no external dependency.
+const progressBarWidth = 20
+
+// ANSI colour helpers — disabled automatically on non-TTY stdout.
 const (
-	reset  = "\033[0m"
-	bold   = "\033[1m"
-	dim    = "\033[2m"
-	green  = "\033[32m"
-	yellow = "\033[33m"
-	cyan   = "\033[36m"
-	red    = "\033[31m"
-	grey   = "\033[90m"
-	blue   = "\033[34m"
+	ansiReset  = "\033[0m"
+	ansiBold   = "\033[1m"
+	ansiDim    = "\033[2m"
+	ansiGreen  = "\033[32m"
+	ansiYellow = "\033[33m"
+	ansiCyan   = "\033[36m"
+	ansiRed    = "\033[31m"
+	ansiGrey   = "\033[90m"
+	ansiBlue   = "\033[34m"
 )
 
-func color(c, s string) string { return c + s + reset }
-func b(s string) string        { return color(bold, s) }
-func dimS(s string) string     { return color(dim+grey, s) }
+// isTTY reports whether stdout is an interactive terminal.
+func isTTY() bool {
+	fi, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
+func color(code, s string) string {
+	if !isTTY() {
+		return s
+	}
+	return code + s + ansiReset
+}
+
+func b(s string) string     { return color(ansiBold, s) }
+func dimS(s string) string  { return color(ansiDim+ansiGrey, s) }
 
 func statusIcon(status string) string {
 	switch status {
 	case "done":
-		return color(green, "✓")
+		return color(ansiGreen, "✓")
 	case "in-progress":
-		return color(yellow, "◎")
+		return color(ansiYellow, "◎")
 	case "archived":
-		return color(grey, "✕")
+		return color(ansiGrey, "✕")
 	default:
-		return color(grey, "○")
+		return color(ansiGrey, "○")
 	}
 }
 
 // PrintProject prints the project header.
 func PrintProject(name, path string) {
-	fmt.Printf("\n%s  %s\n", b(color(cyan, "◆ "+name)), dimS(path))
+	fmt.Printf("\n%s  %s\n", b(color(ansiCyan, "◆ "+name)), dimS(path))
 	fmt.Println(dimS(strings.Repeat("─", 60)))
 }
 
 // PrintStory prints a story and all its tasks/subtasks from a StoryView.
 func PrintStory(v *db.StoryView) {
 	s := v.Story
-	fmt.Printf("\n  %s  %s  %s\n", statusIcon(s.Status), b(color(blue, s.Slug)), b(s.Title))
+	fmt.Printf("\n  %s  %s  %s\n", statusIcon(s.Status), b(color(ansiBlue, s.Slug)), b(s.Title))
 	if s.Description != "" {
 		fmt.Printf("       %s\n", dimS(s.Description))
 	}
@@ -61,14 +79,14 @@ func PrintStory(v *db.StoryView) {
 }
 
 func printTask(t *db.Task, subtasks []*db.Subtask) {
-	fmt.Printf("       %s  %s  %s\n", statusIcon(t.Status), color(yellow, t.Slug), t.Title)
+	fmt.Printf("       %s  %s  %s\n", statusIcon(t.Status), color(ansiYellow, t.Slug), t.Title)
 	for _, st := range subtasks {
 		fmt.Printf("              %s  %s  %s\n",
-			statusIcon(st.Status), color(grey, st.Slug), dimS(st.Title))
+			statusIcon(st.Status), color(ansiGrey, st.Slug), dimS(st.Title))
 	}
 }
 
-// PrintAcceptanceCriteria prints a story's acceptance criteria from JSON.
+// PrintAcceptanceCriteria prints a story's acceptance criteria from a JSON string.
 func PrintAcceptanceCriteria(raw string) {
 	if raw == "" {
 		return
@@ -87,10 +105,10 @@ func PrintAcceptanceCriteria(raw string) {
 // PrintStats prints a project progress summary with visual bars.
 func PrintStats(stats *db.ProjectStats) {
 	fmt.Println()
-	printBar("Stories ", stats.DoneStories, stats.TotalStories, green)
-	printBar("Tasks   ", stats.DoneTasks, stats.TotalTasks, yellow)
+	printBar("Stories ", stats.DoneStories, stats.TotalStories, ansiGreen)
+	printBar("Tasks   ", stats.DoneTasks, stats.TotalTasks, ansiYellow)
 	if stats.TotalSubtasks > 0 {
-		printBar("Subtasks", stats.DoneSubtasks, stats.TotalSubtasks, cyan)
+		printBar("Subtasks", stats.DoneSubtasks, stats.TotalSubtasks, ansiCyan)
 	}
 	fmt.Println()
 }
@@ -100,16 +118,22 @@ func printBar(label string, done, total int, clr string) {
 		fmt.Printf("  %s  %s\n", b(label), dimS("none"))
 		return
 	}
-	const width = 20
-	filled := (done * width) / total
-	bar := color(clr, strings.Repeat("█", filled)) + dimS(strings.Repeat("░", width-filled))
+	if done > total {
+		done = total // guard: prevent negative bar width from integer quirks
+	}
+	filled := (done * progressBarWidth) / total
+	bar := color(clr, strings.Repeat("█", filled)) +
+		dimS(strings.Repeat("░", progressBarWidth-filled))
 	pct := (done * 100) / total
 	fmt.Printf("  %s  [%s] %s%d%%%s %s\n",
-		b(label), bar, bold, pct, reset, dimS(fmt.Sprintf("%d/%d", done, total)))
+		b(label), bar,
+		ansiBold, pct, ansiReset,
+		dimS(fmt.Sprintf("%d/%d", done, total)),
+	)
 }
 
-// Success / Error / Info / Warn are logging helpers used by commands.
-func Success(msg string) { fmt.Printf("%s %s\n", color(green, "✓"), msg) }
-func Error(msg string)   { fmt.Printf("%s %s\n", color(red, "✗"), msg) }
-func Info(msg string)    { fmt.Printf("%s %s\n", color(cyan, "ℹ"), msg) }
-func Warn(msg string)    { fmt.Printf("%s %s\n", color(yellow, "⚠"), msg) }
+// Success / Error / Info / Warn are command output helpers.
+func Success(msg string) { fmt.Printf("%s %s\n", color(ansiGreen, "✓"), msg) }
+func Error(msg string)   { fmt.Printf("%s %s\n", color(ansiRed, "✗"), msg) }
+func Info(msg string)    { fmt.Printf("%s %s\n", color(ansiCyan, "ℹ"), msg) }
+func Warn(msg string)    { fmt.Printf("%s %s\n", color(ansiYellow, "⚠"), msg) }

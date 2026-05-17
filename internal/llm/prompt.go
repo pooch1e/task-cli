@@ -2,23 +2,31 @@ package llm
 
 import (
 	"fmt"
+	"html"
 	"strings"
 )
 
-// systemPrompt is the fixed system message sent with every story request.
+// PromptParts holds the system and user sections of an LLM prompt separately,
+// so providers that support distinct roles (OpenAI) can pass them correctly,
+// while subprocess providers concatenate them.
+type PromptParts struct {
+	System string
+	User   string
+}
+
+// systemPrompt is the fixed system message for every story request.
 const systemPrompt = `You are a software project planning assistant.
 When given a feature description, produce a user story and a list of concrete implementation tasks.
 Respond ONLY with valid JSON. No markdown, no explanation, no code fences.`
 
 // BuildPrompt is exported so commands can display it via --dry-run.
 func BuildPrompt(req StoryRequest) string {
-	return buildPrompt(req)
+	return buildPromptParts(req).User
 }
 
-// buildPrompt builds the user message for story generation.
-// User-supplied strings are sanitised before interpolation.
-func buildPrompt(req StoryRequest) string {
-	return fmt.Sprintf(`Generate a user story and implementation tasks for the following feature.
+// buildPromptParts returns the separated system + user prompt for a story request.
+func buildPromptParts(req StoryRequest) PromptParts {
+	user := fmt.Sprintf(`Generate a user story and implementation tasks for the following feature.
 
 Project: <project>%s</project>
 Feature: <feature>%s</feature>
@@ -47,13 +55,11 @@ Rules:
 		sanitiseInput(req.ProjectName),
 		sanitiseInput(req.Feature),
 	)
+	return PromptParts{System: systemPrompt, User: user}
 }
 
-// sanitiseInput strips characters that could interfere with XML-style delimiters
-// or prematurely close the prompt structure.
+// sanitiseInput applies HTML escaping to prevent XML-delimiter injection and
+// trims surrounding whitespace.
 func sanitiseInput(s string) string {
-	s = strings.ReplaceAll(s, "<", "(")
-	s = strings.ReplaceAll(s, ">", ")")
-	s = strings.TrimSpace(s)
-	return s
+	return strings.TrimSpace(html.EscapeString(s))
 }

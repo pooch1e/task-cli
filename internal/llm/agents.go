@@ -14,9 +14,9 @@ import (
 // subprocessClient runs an external agent binary (pi or opencode) and parses
 // its JSON event stream output. Both tools emit the same event format.
 type subprocessClient struct {
-	cfg     *config.Config
-	binary  string
-	argsFn  func(prompt, model string) []string
+	cfg        *config.Config
+	binary     string
+	buildArgs  func(prompt, model string) []string
 }
 
 func (c *subprocessClient) GenerateStory(req StoryRequest) (*GeneratedStory, error) {
@@ -25,12 +25,18 @@ func (c *subprocessClient) GenerateStory(req StoryRequest) (*GeneratedStory, err
 	return generateWithRetry(ctx, c, req)
 }
 
-// call implements the caller interface: spawns the binary, waits for it to
-// finish, and extracts the last assistant text from the event stream.
-func (c *subprocessClient) call(ctx context.Context, prompt string) (string, error) {
-	args := c.argsFn(prompt, c.cfg.LLM.Model)
+// call implements the caller interface: spawns the binary with a combined
+// system+user prompt and extracts the last assistant text from the event stream.
+func (c *subprocessClient) call(ctx context.Context, parts PromptParts) (string, error) {
+	// Subprocess agents receive a single string prompt — concatenate the parts.
+	combined := parts.System + "\n\n" + parts.User
+	args := c.buildArgs(combined, c.cfg.LLM.Model)
+
 	out, err := exec.CommandContext(ctx, c.binary, args...).Output()
 	if err != nil {
+		if ctx.Err() != nil {
+			return "", fmt.Errorf("%s subprocess timed out after %ds", c.binary, c.cfg.LLM.TimeoutSecs)
+		}
 		return "", fmt.Errorf("%s subprocess failed: %w", c.binary, err)
 	}
 	return extractLastAssistantText(out)
@@ -43,7 +49,7 @@ func PiClient(cfg *config.Config) Client {
 	return &subprocessClient{
 		cfg:    cfg,
 		binary: "pi",
-		argsFn: func(prompt, model string) []string {
+		buildArgs: func(prompt, model string) []string {
 			args := []string{"--mode", "json", "--no-session", "-p", prompt}
 			if model != "" {
 				args = append(args, "--model", model)
@@ -58,7 +64,7 @@ func OpencodeClient(cfg *config.Config) Client {
 	return &subprocessClient{
 		cfg:    cfg,
 		binary: "opencode",
-		argsFn: func(prompt, model string) []string {
+		buildArgs: func(prompt, model string) []string {
 			args := []string{"run", "--format", "json"}
 			if model != "" {
 				args = append(args, "--model", model)
@@ -92,8 +98,12 @@ func extractLastAssistantText(output []byte) (string, error) {
 			buf.Reset()
 
 		case "message_update":
+			ameRaw, ok := event["assistantMessageEvent"]
+			if !ok {
+				break
+			}
 			var ame map[string]json.RawMessage
-			if err := json.Unmarshal(event["assistantMessageEvent"], &ame); err != nil {
+			if err := json.Unmarshal(ameRaw, &ame); err != nil {
 				break
 			}
 			if jsonString(ame["type"]) == "text_delta" {

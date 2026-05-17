@@ -13,6 +13,10 @@ import (
 	"github.com/joelkram/task-cli/internal/config"
 )
 
+// maxResponseBytes caps the LLM response body read. Exceeding this returns an
+// explicit error rather than silently truncating.
+const maxResponseBytes = 64 * 1024
+
 // OpenAIClient works with DeepSeek, OpenAI, and any OpenAI-compatible endpoint.
 type OpenAIClient struct {
 	cfg        *config.Config
@@ -20,10 +24,9 @@ type OpenAIClient struct {
 }
 
 func newOpenAIClient(cfg *config.Config) *OpenAIClient {
-	return &OpenAIClient{
-		cfg:        cfg,
-		httpClient: &http.Client{Timeout: time.Duration(cfg.LLM.TimeoutSecs) * time.Second},
-	}
+	// No Timeout on the http.Client — context-based timeout in GenerateStory
+	// is the single source of truth to avoid compounding timeouts.
+	return &OpenAIClient{cfg: cfg, httpClient: &http.Client{}}
 }
 
 func (c *OpenAIClient) GenerateStory(req StoryRequest) (*GeneratedStory, error) {
@@ -34,12 +37,12 @@ func (c *OpenAIClient) GenerateStory(req StoryRequest) (*GeneratedStory, error) 
 
 // call implements the caller interface: builds the OpenAI messages payload,
 // POSTs to the configured endpoint, and returns the assistant text.
-func (c *OpenAIClient) call(ctx context.Context, prompt string) (string, error) {
+func (c *OpenAIClient) call(ctx context.Context, parts PromptParts) (string, error) {
 	body := openAIRequest{
 		Model: c.cfg.LLM.Model,
 		Messages: []openAIMessage{
-			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: prompt},
+			{Role: "system", Content: parts.System},
+			{Role: "user", Content: parts.User},
 		},
 		MaxTokens:      c.cfg.LLM.MaxTokens,
 		ResponseFormat: &responseFormat{Type: "json_object"},
@@ -50,7 +53,7 @@ func (c *OpenAIClient) call(ctx context.Context, prompt string) (string, error) 
 		return "", err
 	}
 
-	httpReq, err := http.NewRequestWithContext(
+	req, err := http.NewRequestWithContext(
 		ctx, http.MethodPost,
 		c.cfg.LLM.BaseURL+"/chat/completions",
 		bytes.NewReader(raw),
@@ -58,18 +61,23 @@ func (c *OpenAIClient) call(ctx context.Context, prompt string) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+c.cfg.LLM.APIKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.cfg.LLM.APIKey)
 
-	resp, err := c.httpClient.Do(httpReq)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("API request failed: %w", err)
+		// Sanitize error: ensure API key cannot appear in the error string.
+		return "", fmt.Errorf("API request failed: %s", sanitizeErrorMsg(err.Error(), c.cfg.LLM.APIKey))
 	}
 	defer resp.Body.Close()
 
-	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	limited := io.LimitReader(resp.Body, maxResponseBytes+1)
+	respBytes, err := io.ReadAll(limited)
 	if err != nil {
 		return "", fmt.Errorf("reading response: %w", err)
+	}
+	if int64(len(respBytes)) > maxResponseBytes {
+		return "", fmt.Errorf("response exceeded %d byte limit", maxResponseBytes)
 	}
 
 	var apiResp openAIResponse
@@ -80,10 +88,19 @@ func (c *OpenAIClient) call(ctx context.Context, prompt string) (string, error) 
 		return "", fmt.Errorf("API error (%s): %s", apiResp.Error.Type, apiResp.Error.Message)
 	}
 	if len(apiResp.Choices) == 0 {
-		return "", fmt.Errorf("no choices in API response")
+		return "", fmt.Errorf("no choices in API response (body: %.200s)", string(respBytes))
 	}
 
 	return strings.TrimSpace(apiResp.Choices[0].Message.Content), nil
+}
+
+// sanitizeErrorMsg replaces any occurrence of the API key in an error message
+// with a redacted placeholder.
+func sanitizeErrorMsg(msg, apiKey string) string {
+	if apiKey == "" || len(apiKey) < 4 {
+		return msg
+	}
+	return strings.ReplaceAll(msg, apiKey, apiKey[:4]+"…[redacted]")
 }
 
 // ── wire types ────────────────────────────────────────────────────────────────

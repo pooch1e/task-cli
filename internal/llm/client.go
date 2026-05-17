@@ -2,6 +2,9 @@ package llm
 
 import "github.com/joelkram/task-cli/internal/config"
 
+// Note: provider name constants live in the config package to avoid a circular
+// import (llm already imports config).
+
 // StoryRequest is what the user provides to kick off generation.
 type StoryRequest struct {
 	Feature     string
@@ -29,12 +32,11 @@ type Client interface {
 // New returns the right Client based on the provider in cfg.
 func New(cfg *config.Config) Client {
 	switch cfg.LLM.Provider {
-	case "pi":
+	case config.ProviderPi:
 		return PiClient(cfg)
-	case "opencode":
+	case config.ProviderOpencode:
 		return OpencodeClient(cfg)
 	default:
-		// deepseek, openai, or any OpenAI-compatible endpoint
 		return newOpenAIClient(cfg)
 	}
 }

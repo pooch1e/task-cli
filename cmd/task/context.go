@@ -2,16 +2,14 @@ package main
 
 import (
 	"fmt"
-	"os"
 
 	"github.com/joelkram/task-cli/internal/config"
 	"github.com/joelkram/task-cli/internal/db"
 	"github.com/joelkram/task-cli/internal/project"
-	"github.com/joelkram/task-cli/internal/ui"
 )
 
-// AppContext holds the shared state every command needs: config, database,
-// and the current project. Create with openAppContext; close with Close.
+// AppContext holds the shared state every command needs.
+// Create with openAppContext; always defer Close.
 type AppContext struct {
 	Config  *config.Config
 	DB      *db.DB
@@ -19,7 +17,9 @@ type AppContext struct {
 	Root    string
 }
 
-// openAppContext loads config, opens the database, and detects the current project.
+// openAppContext loads config, opens the database, and detects the current
+// project. Returns an error rather than calling os.Exit so cobra can surface
+// it cleanly.
 func openAppContext() (*AppContext, error) {
 	cfg, err := config.LoadOrDefault()
 	if err != nil {
@@ -31,11 +31,16 @@ func openAppContext() (*AppContext, error) {
 		return nil, fmt.Errorf("opening database: %w", err)
 	}
 
-	name, root := project.Detect()
-	p, err := d.UpsertProject(name, root)
+	name, root, err := project.Detect()
 	if err != nil {
 		d.Close()
 		return nil, fmt.Errorf("detecting project: %w", err)
+	}
+
+	p, err := d.UpsertProject(name, root)
+	if err != nil {
+		d.Close()
+		return nil, fmt.Errorf("upserting project %q: %w", name, err)
 	}
 
 	return &AppContext{Config: cfg, DB: d, Project: p, Root: root}, nil
@@ -46,15 +51,4 @@ func (a *AppContext) Close() {
 	if a.DB != nil {
 		a.DB.Close()
 	}
-}
-
-// mustOpen is a convenience wrapper for commands that call os.Exit on failure.
-// Use openAppContext directly in commands that return errors cleanly.
-func mustOpen() *AppContext {
-	ctx, err := openAppContext()
-	if err != nil {
-		ui.Error(err.Error())
-		os.Exit(1)
-	}
-	return ctx
 }

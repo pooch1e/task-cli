@@ -26,21 +26,7 @@ func rootCmd() *cobra.Command {
 		Use:   "task",
 		Short: "Personal user story and task tracker",
 		Long:  "Track user stories, tasks and subtasks for your projects.\nPowered by LLM story generation via DeepSeek, pi, or opencode.",
-		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-			// First-run onboarding: detect missing config + missing env key
-			// Skip for config subcommands which are meant to fix this state
-			if cmd.Name() == "init" || cmd.Parent().Name() == "config" {
-				return nil
-			}
-			_, cfgErr := config.Load()
-			if cfgErr == config.ErrNotFound && os.Getenv("TASK_API_KEY") == "" {
-				printOnboarding()
-				// Don't block — allow commands to run with defaults
-			}
-			return nil
-		},
 	}
-
 	cmd.AddCommand(
 		initCmd(),
 		storyCmd(),
@@ -54,7 +40,6 @@ func rootCmd() *cobra.Command {
 		exportCmd(),
 		configCmd(),
 	)
-
 	return cmd
 }
 
@@ -107,6 +92,14 @@ func storyCmd() *cobra.Command {
 				return nil
 			}
 
+			// First-run check: no config file and no API key for direct providers.
+			if _, cfgErr := config.Load(); cfgErr == config.ErrNotFound &&
+				cfg.LLM.Provider != config.ProviderPi &&
+				cfg.LLM.Provider != config.ProviderOpencode &&
+				os.Getenv("TASK_API_KEY") == "" {
+				printOnboarding()
+			}
+
 			if err := cfg.Validate(); err != nil {
 				ui.Error(err.Error())
 				ui.Info("Set TASK_API_KEY=sk-... or run: task config init")
@@ -129,13 +122,12 @@ func storyCmd() *cobra.Command {
 				return fmt.Errorf("LLM generation failed: %w", err)
 			}
 
-			story, err := persistGeneratedStory(app.DB, app.Project.ID, gen)
+			story, err := saveGeneratedStory(app.DB, app.Project.ID, gen)
 			if err != nil {
 				return err
 			}
 
 			ui.Success(fmt.Sprintf("Created %s: %s", story.Slug, story.Title))
-
 			view, err := app.DB.LoadStoryView(story.ID)
 			if err != nil {
 				return err
@@ -181,7 +173,6 @@ func listCmd() *cobra.Command {
 			}
 
 			ui.PrintProject(app.Project.Name, app.Root)
-
 			if len(views) == 0 {
 				ui.Info("No stories yet. Run: task story \"<feature>\"")
 				return nil
@@ -216,12 +207,10 @@ func showCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("story %q not found in project %q", args[0], app.Project.Name)
 			}
-
 			view, err := app.DB.LoadStoryView(s.ID)
 			if err != nil {
 				return err
 			}
-
 			fmt.Println()
 			ui.PrintStory(view)
 			ui.PrintAcceptanceCriteria(s.AcceptanceCriteria)
@@ -243,12 +232,10 @@ func statusCmd() *cobra.Command {
 				return err
 			}
 			defer app.Close()
-
 			stats, err := app.DB.GetProjectStats(app.Project.ID)
 			if err != nil {
 				return err
 			}
-
 			ui.PrintProject(app.Project.Name, app.Root)
 			ui.PrintStats(stats)
 			return nil
@@ -263,7 +250,7 @@ func doneCmd() *cobra.Command {
 		Use:   "done <T-N | S-N>",
 		Short: "Mark a task or story as done",
 		Args:  cobra.ExactArgs(1),
-		RunE:  setStatusCmd("done"),
+		RunE:  setStatus("done"),
 	}
 }
 
@@ -272,17 +259,17 @@ func startCmd() *cobra.Command {
 		Use:   "start <T-N>",
 		Short: "Mark a task as in-progress",
 		Args:  cobra.ExactArgs(1),
-		RunE:  setStatusCmd("in-progress"),
+		RunE:  setStatus("in-progress"),
 	}
 }
 
-func setStatusCmd(status string) func(*cobra.Command, []string) error {
+// setStatus returns a RunE handler that transitions a slug to the given status.
+func setStatus(status string) func(*cobra.Command, []string) error {
 	return func(cmd *cobra.Command, args []string) error {
 		slug := args[0]
 		if len(slug) < 2 {
 			return fmt.Errorf("invalid slug %q — expected S-N or T-N", slug)
 		}
-
 		app, err := openAppContext()
 		if err != nil {
 			return err
@@ -300,7 +287,6 @@ func setStatusCmd(status string) func(*cobra.Command, []string) error {
 		if err != nil {
 			return err
 		}
-
 		ui.Success(fmt.Sprintf("%s marked as %s", slug, status))
 		return nil
 	}
@@ -309,20 +295,66 @@ func setStatusCmd(status string) func(*cobra.Command, []string) error {
 // ── add ───────────────────────────────────────────────────────────────────────
 
 func addCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "add",
-		Short: "Manually add a task or subtask",
-	}
-	cmd.AddCommand(addTaskCmd(), addSubtaskCmd())
+	cmd := &cobra.Command{Use: "add", Short: "Manually add a task or subtask"}
+	cmd.AddCommand(
+		addChildCmd(addChildConfig{
+			use:       "task <title>",
+			short:     "Add a task to a story",
+			flagName:  "story",
+			flagUsage: "Story slug (e.g. S-1)",
+			lookup: func(app *AppContext, slug string) (int64, error) {
+				s, err := app.DB.GetStoryBySlug(app.Project.ID, slug)
+				if err != nil {
+					return 0, fmt.Errorf("story %q not found", slug)
+				}
+				return s.ID, nil
+			},
+			create: func(app *AppContext, parentID int64, title string) (string, string, error) {
+				t, err := app.DB.CreateTask(parentID, title)
+				if err != nil {
+					return "", "", err
+				}
+				return t.Slug, t.Title, nil
+			},
+		}),
+		addChildCmd(addChildConfig{
+			use:       "subtask <title>",
+			short:     "Add a subtask to a task",
+			flagName:  "task",
+			flagUsage: "Task slug (e.g. T-1)",
+			lookup: func(app *AppContext, slug string) (int64, error) {
+				t, err := app.DB.GetTaskBySlug(app.Project.ID, slug)
+				if err != nil {
+					return 0, fmt.Errorf("task %q not found", slug)
+				}
+				return t.ID, nil
+			},
+			create: func(app *AppContext, parentID int64, title string) (string, string, error) {
+				st, err := app.DB.CreateSubtask(parentID, title)
+				if err != nil {
+					return "", "", err
+				}
+				return st.Slug, st.Title, nil
+			},
+		}),
+	)
 	return cmd
 }
 
-func addTaskCmd() *cobra.Command {
-	var storySlug string
+// addChildConfig parameterises addChildCmd for both task and subtask creation.
+type addChildConfig struct {
+	use, short, flagName, flagUsage string
+	lookup                          func(*AppContext, string) (int64, error)
+	create                          func(*AppContext, int64, string) (string, string, error)
+}
 
+// addChildCmd builds a cobra sub-command that looks up a parent by slug and
+// creates a child record, printing the new slug on success.
+func addChildCmd(cfg addChildConfig) *cobra.Command {
+	var parentSlug string
 	cmd := &cobra.Command{
-		Use:   "task <title>",
-		Short: "Add a task to a story",
+		Use:   cfg.use,
+		Short: cfg.short,
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			app, err := openAppContext()
@@ -331,57 +363,20 @@ func addTaskCmd() *cobra.Command {
 			}
 			defer app.Close()
 
-			s, err := app.DB.GetStoryBySlug(app.Project.ID, storySlug)
-			if err != nil {
-				return fmt.Errorf("story %q not found", storySlug)
-			}
-
-			t, err := app.DB.CreateTask(s.ID, args[0])
+			parentID, err := cfg.lookup(app, parentSlug)
 			if err != nil {
 				return err
 			}
-
-			ui.Success(fmt.Sprintf("Created %s: %s", t.Slug, t.Title))
+			slug, title, err := cfg.create(app, parentID, args[0])
+			if err != nil {
+				return err
+			}
+			ui.Success(fmt.Sprintf("Created %s: %s", slug, title))
 			return nil
 		},
 	}
-
-	cmd.Flags().StringVar(&storySlug, "story", "", "Story slug (e.g. S-1)")
-	_ = cmd.MarkFlagRequired("story")
-	return cmd
-}
-
-func addSubtaskCmd() *cobra.Command {
-	var taskSlug string
-
-	cmd := &cobra.Command{
-		Use:   "subtask <title>",
-		Short: "Add a subtask to a task",
-		Args:  cobra.MinimumNArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			app, err := openAppContext()
-			if err != nil {
-				return err
-			}
-			defer app.Close()
-
-			t, err := app.DB.GetTaskBySlug(app.Project.ID, taskSlug)
-			if err != nil {
-				return fmt.Errorf("task %q not found", taskSlug)
-			}
-
-			st, err := app.DB.CreateSubtask(t.ID, args[0])
-			if err != nil {
-				return err
-			}
-
-			ui.Success(fmt.Sprintf("Created %s: %s", st.Slug, st.Title))
-			return nil
-		},
-	}
-
-	cmd.Flags().StringVar(&taskSlug, "task", "", "Task slug (e.g. T-1)")
-	_ = cmd.MarkFlagRequired("task")
+	cmd.Flags().StringVar(&parentSlug, cfg.flagName, "", cfg.flagUsage)
+	_ = cmd.MarkFlagRequired(cfg.flagName)
 	return cmd
 }
 
@@ -399,11 +394,10 @@ func rmCmd() *cobra.Command {
 			if len(slug) < 2 {
 				return fmt.Errorf("invalid slug %q", slug)
 			}
-
 			if !yes {
 				fmt.Printf("Remove %s and all its children? [y/N] ", slug)
 				var confirm string
-				fmt.Scanln(&confirm)
+				fmt.Scanln(&confirm) //nolint:errcheck
 				if confirm != "y" && confirm != "Y" {
 					ui.Info("Aborted.")
 					return nil
@@ -427,12 +421,10 @@ func rmCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-
 			ui.Success(fmt.Sprintf("Removed %s", slug))
 			return nil
 		},
 	}
-
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "Skip confirmation prompt")
 	return cmd
 }
@@ -440,8 +432,7 @@ func rmCmd() *cobra.Command {
 // ── export ────────────────────────────────────────────────────────────────────
 
 func exportCmd() *cobra.Command {
-	var format string
-	var outFile string
+	var format, outFile string
 
 	cmd := &cobra.Command{
 		Use:   "export",
@@ -481,7 +472,6 @@ func exportCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-
 			if outFile != "" {
 				ui.Success(fmt.Sprintf("Exported to %s", outFile))
 			}
@@ -497,10 +487,7 @@ func exportCmd() *cobra.Command {
 // ── config ────────────────────────────────────────────────────────────────────
 
 func configCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "config",
-		Short: "Manage task configuration",
-	}
+	cmd := &cobra.Command{Use: "config", Short: "Manage task configuration"}
 	cmd.AddCommand(configInitCmd(), configShowCmd())
 	return cmd
 }
@@ -511,17 +498,14 @@ func configInitCmd() *cobra.Command {
 		Short: "Create default config at ~/.task/config.toml",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			path, _ := config.Path()
-
 			if _, err := os.Stat(path); err == nil {
 				ui.Warn(fmt.Sprintf("Config already exists at %s", path))
 				ui.Info("Edit it directly, or delete it and re-run to regenerate.")
 				return nil
 			}
-
 			if err := config.Save(config.Default()); err != nil {
 				return err
 			}
-
 			ui.Success(fmt.Sprintf("Config created at %s", path))
 			ui.Info("Set your API key: edit the file or set TASK_API_KEY=sk-...")
 			ui.Info("For free usage: set provider = \"pi\" and use --model github-copilot/claude-haiku-4.5")
@@ -543,68 +527,50 @@ func configShowCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-
-			display := *cfg
-			if display.LLM.APIKey != "" {
-				n := len(display.LLM.APIKey)
-				if n > 8 {
-					n = 8
-				}
-				display.LLM.APIKey = display.LLM.APIKey[:n] + "…"
+			key := cfg.LLM.APIKey
+			if len(key) > 8 {
+				key = key[:8] + "…"
 			}
-
 			path, _ := config.Path()
 			fmt.Printf("Config: %s\n\n", path)
-			fmt.Printf("  provider:  %s\n", display.LLM.Provider)
-			fmt.Printf("  model:     %s\n", display.LLM.Model)
-			fmt.Printf("  base_url:  %s\n", display.LLM.BaseURL)
-			fmt.Printf("  api_key:   %s\n", display.LLM.APIKey)
-			fmt.Printf("  db_path:   %s\n", display.Storage.DBPath)
+			fmt.Printf("  provider:  %s\n", cfg.LLM.Provider)
+			fmt.Printf("  model:     %s\n", cfg.LLM.Model)
+			fmt.Printf("  base_url:  %s\n", cfg.LLM.BaseURL)
+			fmt.Printf("  api_key:   %s\n", key)
+			fmt.Printf("  db_path:   %s\n", cfg.Storage.DBPath)
 			return nil
 		},
 	}
 }
 
-// ── internal helpers ──────────────────────────────────────────────────────────
+// ── helpers ───────────────────────────────────────────────────────────────────
 
-// persistGeneratedStory writes a GeneratedStory to the database and returns
-// the created Story record.
-func persistGeneratedStory(d *db.DB, projectID int64, gen *llm.GeneratedStory) (*db.Story, error) {
-	acJSON, _ := json.Marshal(gen.Story.AcceptanceCriteria)
-
-	story, err := d.CreateStory(projectID, gen.Story.Title, gen.Story.Description, string(acJSON))
+// saveGeneratedStory converts a GeneratedStory to DB inputs and persists it
+// atomically via db.PersistStory (single transaction).
+func saveGeneratedStory(d *db.DB, projectID int64, gen *llm.GeneratedStory) (*db.Story, error) {
+	acJSON, err := json.Marshal(gen.Story.AcceptanceCriteria)
 	if err != nil {
-		return nil, fmt.Errorf("saving story: %w", err)
+		return nil, fmt.Errorf("marshaling acceptance criteria: %w", err)
 	}
 
-	for _, t := range gen.Tasks {
-		task, err := d.CreateTask(story.ID, t.Title)
-		if err != nil {
-			return nil, fmt.Errorf("saving task: %w", err)
-		}
-		for _, st := range t.Subtasks {
-			if _, err := d.CreateSubtask(task.ID, st); err != nil {
-				return nil, fmt.Errorf("saving subtask: %w", err)
-			}
-		}
+	tasks := make([]db.TaskInput, len(gen.Tasks))
+	for i, t := range gen.Tasks {
+		tasks[i] = db.TaskInput{Title: t.Title, Subtasks: t.Subtasks}
 	}
 
-	return story, nil
+	return d.PersistStory(projectID, gen.Story.Title, gen.Story.Description, string(acJSON), tasks)
 }
 
-// printOnboarding prints a first-run guide when no config and no API key exist.
+// printOnboarding prints a first-run setup guide.
 func printOnboarding() {
 	ui.Warn("No config found and TASK_API_KEY is not set.")
 	fmt.Println()
-	fmt.Println("  Quick setup options:")
+	fmt.Println("  Quick setup:")
 	fmt.Println()
-	fmt.Println("  1. Free via GitHub Copilot (recommended):")
-	fmt.Println("       task config init")
-	fmt.Println("       # then edit ~/.task/config.toml: set provider = \"pi\"")
-	fmt.Println("       task story \"your feature\" --agent pi --model github-copilot/claude-haiku-4.5")
+	fmt.Println("  Free via GitHub Copilot:")
+	fmt.Println("    task story \"your feature\" --agent pi --model github-copilot/claude-haiku-4.5")
 	fmt.Println()
-	fmt.Println("  2. DeepSeek direct (~$0.00011 per call):")
-	fmt.Println("       task config init")
-	fmt.Println("       export TASK_API_KEY=sk-...")
+	fmt.Println("  DeepSeek direct (~$0.00011/call):")
+	fmt.Println("    task config init && export TASK_API_KEY=sk-...")
 	fmt.Println()
 }

@@ -10,6 +10,13 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
+// Provider constants — single source of truth. Defined here so both config
+// validation and the llm package can use them without a circular import.
+const (
+	ProviderPi       = "pi"
+	ProviderOpencode = "opencode"
+)
+
 type LLMConfig struct {
 	Provider    string `toml:"provider"`
 	Model       string `toml:"model"`
@@ -51,9 +58,10 @@ func Path() (string, error) {
 	return filepath.Join(dir, "config.toml"), nil
 }
 
-// Load reads the config file. Returns ErrNotFound if the file doesn't exist.
+// ErrNotFound is returned by Load when the config file does not exist.
 var ErrNotFound = errors.New("config not found")
 
+// Load reads the config file. Returns ErrNotFound if the file doesn't exist.
 func Load() (*Config, error) {
 	path, err := Path()
 	if err != nil {
@@ -70,16 +78,22 @@ func Load() (*Config, error) {
 	}
 
 	cfg.applyDefaults()
-
-	// env var overrides api_key
-	if key := os.Getenv("TASK_API_KEY"); key != "" {
-		cfg.LLM.APIKey = key
-	}
+	cfg.applyEnvOverrides()
 
 	return &cfg, nil
 }
 
-// Save writes config to ~/.task/config.toml with mode 0600.
+// LoadOrDefault loads config, returning Default() if the file does not exist.
+func LoadOrDefault() (*Config, error) {
+	cfg, err := Load()
+	if err == ErrNotFound {
+		return Default(), nil
+	}
+	return cfg, err
+}
+
+// Save writes cfg to ~/.task/config.toml with mode 0600.
+// O_NOFOLLOW prevents symlink-based attacks on the config path.
 func Save(cfg *Config) error {
 	dir, err := Dir()
 	if err != nil {
@@ -99,10 +113,10 @@ func Save(cfg *Config) error {
 	return toml.NewEncoder(f).Encode(cfg)
 }
 
-// Default returns a config with sensible defaults (no API key).
+// Default returns a config with sensible defaults and no API key.
 func Default() *Config {
 	dir, _ := Dir()
-	cfg := &Config{
+	return &Config{
 		LLM: LLMConfig{
 			Provider:    "deepseek",
 			Model:       "deepseek-chat",
@@ -117,9 +131,10 @@ func Default() *Config {
 			AutoDetect: true,
 		},
 	}
-	return cfg
 }
 
+// applyDefaults fills zero-value fields with defaults. Each field is checked
+// individually — add a corresponding check here whenever adding a new field.
 func (c *Config) applyDefaults() {
 	d := Default()
 	if c.LLM.Provider == "" {
@@ -142,21 +157,36 @@ func (c *Config) applyDefaults() {
 	}
 }
 
-// LoadOrDefault loads config, returning Default() if the file does not exist.
-func LoadOrDefault() (*Config, error) {
-	cfg, err := Load()
-	if err == ErrNotFound {
-		return Default(), nil
+// applyEnvOverrides applies environment variable overrides. Env vars take
+// precedence over the config file. Supported vars:
+//
+//	TASK_API_KEY   — overrides llm.api_key
+//	TASK_PROVIDER  — overrides llm.provider
+//	TASK_MODEL     — overrides llm.model
+//	TASK_BASE_URL  — overrides llm.base_url
+func (c *Config) applyEnvOverrides() {
+	if v := os.Getenv("TASK_API_KEY"); v != "" {
+		c.LLM.APIKey = v
 	}
-	return cfg, err
+	if v := os.Getenv("TASK_PROVIDER"); v != "" {
+		c.LLM.Provider = v
+	}
+	if v := os.Getenv("TASK_MODEL"); v != "" {
+		c.LLM.Model = v
+	}
+	if v := os.Getenv("TASK_BASE_URL"); v != "" {
+		c.LLM.BaseURL = v
+	}
 }
 
-// Validate returns an error if required fields are missing.
+// Validate returns an error if required fields are missing for the chosen provider.
 func (c *Config) Validate() error {
-	if c.LLM.Provider != "pi" && c.LLM.Provider != "opencode" && c.LLM.APIKey == "" {
-		if os.Getenv("TASK_API_KEY") == "" {
-			return fmt.Errorf("no API key set — add api_key to config or set TASK_API_KEY env var")
-		}
+	// Subprocess providers use their own credential stores — no key needed.
+	if c.LLM.Provider == ProviderPi || c.LLM.Provider == ProviderOpencode {
+		return nil
+	}
+	if c.LLM.APIKey == "" {
+		return fmt.Errorf("no API key set — add api_key to config or set TASK_API_KEY env var")
 	}
 	return nil
 }

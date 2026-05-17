@@ -10,40 +10,64 @@ import (
 	"github.com/joelkram/task-cli/internal/db"
 )
 
-// ToMarkdown writes all stories and their tasks as GitHub-style markdown
-// to w. Each story becomes an h2 section; each task is a checklist item.
+// ── output types (package-level so they are testable) ─────────────────────────
+
+type subtaskOut struct {
+	Slug   string `json:"slug"`
+	Title  string `json:"title"`
+	Status string `json:"status"`
+}
+
+type taskOut struct {
+	Slug     string       `json:"slug"`
+	Title    string       `json:"title"`
+	Status   string       `json:"status"`
+	Subtasks []subtaskOut `json:"subtasks"`
+}
+
+type storyOut struct {
+	Slug               string    `json:"slug"`
+	Title              string    `json:"title"`
+	Description        string    `json:"description"`
+	AcceptanceCriteria []string  `json:"acceptance_criteria"`
+	Status             string    `json:"status"`
+	CreatedAt          time.Time `json:"created_at"`
+	Tasks              []taskOut `json:"tasks"`
+}
+
+type exportPayload struct {
+	Project    string    `json:"project"`
+	ExportedAt time.Time `json:"exported_at"`
+	Stories    []storyOut `json:"stories"`
+}
+
+// ── public functions ──────────────────────────────────────────────────────────
+
+// ToMarkdown writes all stories and their tasks as GitHub-style markdown to w.
 func ToMarkdown(w io.Writer, proj *db.Project, views []*db.StoryView) error {
 	fmt.Fprintf(w, "# %s — Task Export\n\n", proj.Name)
 	fmt.Fprintf(w, "_Generated: %s_\n\n---\n\n", time.Now().Format("2006-01-02 15:04"))
 
 	for _, v := range views {
 		s := v.Story
-		doneIcon := "[ ]"
-		if s.Status == "done" {
-			doneIcon = "[x]"
-		}
-		fmt.Fprintf(w, "## %s %s — %s\n\n", doneIcon, s.Slug, s.Title)
-
+		fmt.Fprintf(w, "## %s %s — %s\n\n", checkBox(s.Status), s.Slug, s.Title)
 		if s.Description != "" {
 			fmt.Fprintf(w, "%s\n\n", s.Description)
 		}
 
-		// Acceptance criteria
-		var criteria []string
-		if err := json.Unmarshal([]byte(s.AcceptanceCriteria), &criteria); err == nil && len(criteria) > 0 {
-			fmt.Fprintf(w, "**Acceptance Criteria**\n\n")
+		criteria := parseCriteria(s.AcceptanceCriteria)
+		if len(criteria) > 0 {
+			fmt.Fprintln(w, "**Acceptance Criteria**\n")
 			for _, c := range criteria {
 				fmt.Fprintf(w, "- %s\n", c)
 			}
 			fmt.Fprintln(w)
 		}
 
-		// Tasks
 		if len(v.Tasks) > 0 {
-			fmt.Fprintf(w, "**Tasks**\n\n")
+			fmt.Fprintln(w, "**Tasks**\n")
 			for _, t := range v.Tasks {
-				check := checkBox(t.Status)
-				fmt.Fprintf(w, "- %s `%s` %s\n", check, t.Slug, t.Title)
+				fmt.Fprintf(w, "- %s `%s` %s\n", checkBox(t.Status), t.Slug, t.Title)
 				for _, st := range v.Subtasks[t.ID] {
 					fmt.Fprintf(w, "  - %s `%s` %s\n", checkBox(st.Status), st.Slug, st.Title)
 				}
@@ -51,54 +75,33 @@ func ToMarkdown(w io.Writer, proj *db.Project, views []*db.StoryView) error {
 			fmt.Fprintln(w)
 		}
 
-		fmt.Fprintln(w, "---")
-		fmt.Fprintln(w)
+		fmt.Fprintln(w, "---\n")
 	}
 	return nil
 }
 
 // ToJSON writes a full structured dump of all stories to w.
 func ToJSON(w io.Writer, proj *db.Project, views []*db.StoryView) error {
-	type subtaskOut struct {
-		Slug   string `json:"slug"`
-		Title  string `json:"title"`
-		Status string `json:"status"`
-	}
-	type taskOut struct {
-		Slug     string       `json:"slug"`
-		Title    string       `json:"title"`
-		Status   string       `json:"status"`
-		Subtasks []subtaskOut `json:"subtasks"`
-	}
-	type storyOut struct {
-		Slug               string    `json:"slug"`
-		Title              string    `json:"title"`
-		Description        string    `json:"description"`
-		AcceptanceCriteria []string  `json:"acceptance_criteria"`
-		Status             string    `json:"status"`
-		CreatedAt          time.Time `json:"created_at"`
-		Tasks              []taskOut `json:"tasks"`
-	}
-	type output struct {
-		Project   string     `json:"project"`
-		ExportedAt time.Time `json:"exported_at"`
-		Stories   []storyOut `json:"stories"`
-	}
+	payload := buildPayload(proj, views)
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(payload)
+}
 
-	out := output{
+// ── private helpers ───────────────────────────────────────────────────────────
+
+// buildPayload converts DB views into the serialisable export structure.
+func buildPayload(proj *db.Project, views []*db.StoryView) exportPayload {
+	out := exportPayload{
 		Project:    proj.Name,
 		ExportedAt: time.Now().UTC(),
 	}
-
 	for _, v := range views {
-		var criteria []string
-		_ = json.Unmarshal([]byte(v.Story.AcceptanceCriteria), &criteria)
-
 		so := storyOut{
 			Slug:               v.Story.Slug,
 			Title:              v.Story.Title,
 			Description:        v.Story.Description,
-			AcceptanceCriteria: criteria,
+			AcceptanceCriteria: parseCriteria(v.Story.AcceptanceCriteria),
 			Status:             v.Story.Status,
 			CreatedAt:          v.Story.CreatedAt,
 		}
@@ -111,10 +114,20 @@ func ToJSON(w io.Writer, proj *db.Project, views []*db.StoryView) error {
 		}
 		out.Stories = append(out.Stories, so)
 	}
+	return out
+}
 
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	return enc.Encode(out)
+// parseCriteria unmarshals a JSON acceptance-criteria string. Returns nil (not
+// an empty slice) on empty or invalid input so callers can check len() safely.
+func parseCriteria(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil
+	}
+	return out
 }
 
 func checkBox(status string) string {
