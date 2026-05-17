@@ -16,23 +16,21 @@
 class TaskCli < Formula
   desc "Personal user story and task tracker with LLM generation"
   homepage "https://github.com/pooch1e/task-cli"
-  version "0.1.0"  # TODO: update on each release
+  version "0.1.0"
 
   license "MIT"
 
   on_macos do
     if Hardware::CPU.arm?
       url "https://github.com/pooch1e/task-cli/releases/download/v#{version}/task-darwin-arm64"
-      # TODO: replace with real sha256 from dist/checksums.txt
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "0c6f68fee7bf2d190189bfa8b1b6b29f764aa2f355f230d3248a15cf3d13cf91"
 
       def install
         bin.install "task-darwin-arm64" => "task"
       end
     else
       url "https://github.com/pooch1e/task-cli/releases/download/v#{version}/task-darwin-amd64"
-      # TODO: replace with real sha256 from dist/checksums.txt
-      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+      sha256 "ee994d881c2239a758565ad3f71c1a4ccbf9765ee36009637434d27f2725a612"
 
       def install
         bin.install "task-darwin-amd64" => "task"
@@ -42,8 +40,7 @@ class TaskCli < Formula
 
   on_linux do
     url "https://github.com/pooch1e/task-cli/releases/download/v#{version}/task-linux-amd64"
-    # TODO: replace with real sha256 from dist/checksums.txt
-    sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+    sha256 "3e03f7545b0c66b4863ef353affa12ca19ad918d004a6d39c2b2648b4944f921"
 
     def install
       bin.install "task-linux-amd64" => "task"
