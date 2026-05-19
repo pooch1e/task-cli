@@ -1,6 +1,8 @@
 BINARY    = task
 BUILD_DIR = ./cmd/task
 INSTALL_DIR = $(HOME)/.local/bin
+MAN_DIR   = /usr/local/share/man/man1
+MAN_PAGE  = man/task-cli.1
 
 # Embed the git tag (falls back to commit hash when no tags exist).
 # --dirty is intentionally excluded — it makes checksums non-deterministic.
@@ -9,18 +11,33 @@ VERSION  ?= $(shell git describe --tags --always 2>/dev/null || echo "dev")
 # Quote the version string to survive spaces/special chars in shell expansion.
 LDFLAGS   = -ldflags "-s -w -X 'main.version=$(VERSION)'"
 
-.PHONY: build install snapshot release checksums clean test lint help
+.PHONY: build install man snapshot release checksums clean test lint help
 
 ## build: compile for the current platform with version embedded
 build:
 	go build $(LDFLAGS) -o $(BINARY) $(BUILD_DIR)
 
-## install: build and copy to INSTALL_DIR (default: ~/.local/bin)
-install: build
+## man: generate man/task-cli.1 from cobra command metadata
+man:
+	@mkdir -p man
+	go run ./cmd/gendocs/ -o man/
+	@# cobra/doc names the file after the command Use field ("task.1"); rename it.
+	@mv -f man/task.1 man/task-cli.1 2>/dev/null || true
+	@echo "Man page written to man/task-cli.1"
+
+## install: build, install binary, and install man page to MAN_DIR
+install: build man
 	@mkdir -p $(INSTALL_DIR)
 	cp $(BINARY) $(INSTALL_DIR)/$(BINARY)
 	@test -x $(INSTALL_DIR)/$(BINARY) || chmod +x $(INSTALL_DIR)/$(BINARY)
 	@echo "Installed $(BINARY) $(VERSION) → $(INSTALL_DIR)/$(BINARY)"
+	@if [ -d "$(MAN_DIR)" ] || mkdir -p "$(MAN_DIR)" 2>/dev/null; then \
+		cp $(MAN_PAGE) $(MAN_DIR)/task-cli.1; \
+		echo "Man page installed → $(MAN_DIR)/task-cli.1"; \
+	else \
+		echo "Note: could not install man page (no write access to $(MAN_DIR))"; \
+		echo "      Install manually: sudo cp $(MAN_PAGE) $(MAN_DIR)/task-cli.1"; \
+	fi
 
 ## snapshot: fast dev build without version injection
 snapshot:
@@ -52,7 +69,7 @@ checksums:
 ## clean: remove build artefacts
 clean:
 	rm -f $(BINARY)
-	rm -rf dist/
+	rm -rf dist/ man/
 
 ## test: run the full test suite
 test:

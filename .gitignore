@@ -1,5 +1,7 @@
 /task
+/gendocs
 dist/
+man/
 *.db
 *.db-shm
 *.db-wal
