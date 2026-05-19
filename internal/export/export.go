@@ -36,8 +36,8 @@ type storyOut struct {
 }
 
 type exportPayload struct {
-	Project    string    `json:"project"`
-	ExportedAt time.Time `json:"exported_at"`
+	Project    string     `json:"project"`
+	ExportedAt time.Time  `json:"exported_at"`
 	Stories    []storyOut `json:"stories"`
 }
 
@@ -57,7 +57,7 @@ func ToMarkdown(w io.Writer, proj *db.Project, views []*db.StoryView) error {
 
 		criteria := parseCriteria(s.AcceptanceCriteria)
 		if len(criteria) > 0 {
-			fmt.Fprintln(w, "**Acceptance Criteria**\n")
+			fmt.Fprintln(w, "**Acceptance Criteria**")
 			for _, c := range criteria {
 				fmt.Fprintf(w, "- %s\n", c)
 			}
@@ -65,7 +65,7 @@ func ToMarkdown(w io.Writer, proj *db.Project, views []*db.StoryView) error {
 		}
 
 		if len(v.Tasks) > 0 {
-			fmt.Fprintln(w, "**Tasks**\n")
+			fmt.Fprintln(w, "**Tasks**")
 			for _, t := range v.Tasks {
 				fmt.Fprintf(w, "- %s `%s` %s\n", checkBox(t.Status), t.Slug, t.Title)
 				for _, st := range v.Subtasks[t.ID] {
@@ -75,7 +75,7 @@ func ToMarkdown(w io.Writer, proj *db.Project, views []*db.StoryView) error {
 			fmt.Fprintln(w)
 		}
 
-		fmt.Fprintln(w, "---\n")
+		fmt.Fprintln(w, "---")
 	}
 	return nil
 }
