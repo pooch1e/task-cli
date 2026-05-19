@@ -35,10 +35,15 @@ type ProjectConfig struct {
 	AutoDetect bool `toml:"auto_detect"`
 }
 
+type ObsidianConfig struct {
+	VaultPath string `toml:"vault_path"`
+}
+
 type Config struct {
-	LLM     LLMConfig     `toml:"llm"`
-	Storage StorageConfig `toml:"storage"`
-	Project ProjectConfig `toml:"project"`
+	LLM      LLMConfig      `toml:"llm"`
+	Storage  StorageConfig  `toml:"storage"`
+	Project  ProjectConfig  `toml:"project"`
+	Obsidian ObsidianConfig `toml:"obsidian"`
 }
 
 // Dir returns ~/.task
